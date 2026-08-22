@@ -92,9 +92,19 @@ class PublicExportTest(unittest.TestCase):
         with mock.patch.object(mod, "tg", lambda *a, **k: self.fail("must not send")):
             self.assertEqual(mod.deliver_mesh_event("final", "   "), {"deliveries": []})
 
-    def test_answer_is_sent_whole(self):
+    def test_trailing_suggested_reply_is_split(self):
         mod = load_bridge("grb_suggested")
-        self.assertEqual(mod.split_suggested_reply("body text"), ("body text", ""))
+        open_m = "<" + "추천답변" + ">"
+        close_m = "</" + "추천답변" + ">"
+        self.assertEqual(
+            mod.split_suggested_reply("hello\n" + open_m + "yes" + close_m),
+            ("hello", "yes"),
+        )
+        self.assertEqual(mod.split_suggested_reply("hello"), ("hello", ""))
+        self.assertEqual(
+            mod.split_suggested_reply("see " + open_m + "no" + close_m + " in the middle"),
+            ("see " + open_m + "no" + close_m + " in the middle", ""),
+        )
 
 
 if __name__ == "__main__":

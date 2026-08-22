@@ -1177,17 +1177,35 @@ def _first_sent_message_id(mesh_result, surface=SEND_SURFACE):
 
 SUGGESTED_SURFACE = SEND_SURFACE
 SUGGESTED_SPLIT_LOG_KEY = "grb_suggested_split"
+SUGGESTED_OPEN = "<" + "추천답변" + ">"
+SUGGESTED_CLOSE = "</" + "추천답변" + ">"
 
 
 def split_suggested_reply(text):
-    """Public builds send the answer as-is.
+    """Split a trailing suggestion marker into (body, suggestion).
 
-    The maintainer's internal build splits a trailing marker into a second
-    "copy this" bubble using the sister bridge's parser. That parser is not
-    part of this package, and the marker is an internal convention, so the
-    public bridge keeps the answer whole.
+    Only a marker at the very end of the answer is a suggestion. A marker in
+    the middle of the prose is left in the body. The maintainer private
+    parser has more repair rules; this public copy only implements the tail
+    split, which is what the confirm-button bubble needs.
     """
-    return text or "", ""
+    raw = text or ""
+    stripped = raw.rstrip()
+    if not stripped.endswith(SUGGESTED_CLOSE):
+        return raw, ""
+    open_at = stripped.rfind(SUGGESTED_OPEN)
+    close_at = stripped.rfind(SUGGESTED_CLOSE)
+    if open_at < 0 or close_at < 0 or open_at > close_at:
+        return raw, ""
+    if stripped[close_at + len(SUGGESTED_CLOSE):].strip():
+        return raw, ""
+    reply = stripped[open_at + len(SUGGESTED_OPEN):close_at].strip()
+    body = stripped[:open_at].rstrip()
+    if not reply:
+        return raw, ""
+    if not body:
+        return raw, ""
+    return body, reply
 
 
 def mirror_answer(source, text, task_id=None):
