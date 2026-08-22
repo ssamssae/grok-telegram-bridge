@@ -9,9 +9,12 @@ Session continuity: grok's `-s` flag only accepts a UUID, so a chat_id ->
 session uuid mapping is kept in a local state file instead of reusing a
 human-readable key.
 """
+import http.client
 import importlib.util
 import json
+import mimetypes
 import os
+import shlex
 import queue
 import subprocess
 import stat
@@ -72,15 +75,26 @@ def grok_child_env():
 GROK_TIMEOUT = int_env("GRB_GROK_TIMEOUT", 180, minimum=1)
 TYPING_INTERVAL = int_env("GRB_TYPING_INTERVAL", 4, minimum=1)
 DRY_RUN = bool_env("GRB_DRY_RUN", False)
-# T-260822-041 — 사용자 지시(2026-08-22 12:08): 그록 위에 씌운 층을 벗기고 순정으로 넘긴다.  (기본 off — 되살리려면 GRB_SUGGESTED_REPLY_EYES=1)
+# 👀 는 요청 범위 밖 — 기본 off. 켜려면 GRB_SUGGESTED_REPLY_EYES=1.
 SUGGESTED_REPLY_EYES = bool_env("GRB_SUGGESTED_REPLY_EYES", False)
-# 추천답변 마커 분리도 기본 off = 그록 답을 ★원문 그대로 1통으로 보낸다.
-SUGGESTED_REPLY_SPLIT = bool_env("GRB_SUGGESTED_REPLY_SPLIT", False)
+# T-260822-052 — 사용자 직지(2026-08-22 15:2x): 본문에서 <추천답변> 태그를 빼고 버블을 따로 보낸다.
+#   T-260822-041 의 「원문 1통」 기본은 이 지시로 뒤집힘. 끄려면 GRB_SUGGESTED_REPLY_SPLIT=0.
+SUGGESTED_REPLY_SPLIT = bool_env("GRB_SUGGESTED_REPLY_SPLIT", True)
 LOCAL_INPUT = env(
     "GRB_LOCAL_INPUT",
     os.path.join(STATE_DIR, f"grok-bridge-{NAME}.fifo") if hasattr(os, "mkfifo") else "0",
 )
 STDIN_INPUT = bool_env("GRB_STDIN_INPUT", sys.stdin.isatty())
+# T-260822-048 — 수신 미디어. 클로드 브릿지(clb) 와 같은 확장자·프롬프트 계약.
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+AUDIO_TRANSCRIBE_CMD = env("GRB_AUDIO_TRANSCRIBE_CMD", "")
+AUDIO_TRANSCRIBE_TIMEOUT = int_env("GRB_AUDIO_TRANSCRIBE_TIMEOUT", 60, minimum=1)
+try:
+    DOWNLOAD_ATTEMPT_TIMEOUT = float(env("GRB_DOWNLOAD_ATTEMPT_TIMEOUT_SEC", "30") or "30")
+except ValueError:
+    DOWNLOAD_ATTEMPT_TIMEOUT = 30.0
 
 # 라이브 모드에서만 토큰 파일을 강제한다 — dry-run(테스트·개발)은 grok 호출과 발신을
 # 스텁·모킹으로 대체하므로 실토큰이 필요 없다.
@@ -676,6 +690,9 @@ TUI_SUBMIT_KEY = env("GRB_TUI_SUBMIT_KEY", "Enter")
 #   「먹통」으로 보인다. 원 증상보다 나쁘다.
 #   ⇒ 자르는 기준은 ★출력이 멈춘 시간이다. 세션 히스토리에 새 행이 붙으면 일하는 중이니
 #     기다리고, 아무 행도 안 붙으면 IDLE 상한에서 자른다.
+#   ★열린 도구(tool_call 있고 tool_result 없음)는 새 행이 없어도 일하는 중이다
+#     (T-260822-053). 도구 실행 중엔 jsonl 이 멈춘다 — 그걸 무진전으로 보면 긴 셸이
+#     3분에 잘린다. 침묵(도구 없음) idle 과 최종 캡은 그대로 둔다.
 #   이 repo 관용구 정렬 = claude 브릿지의 「liveness 가 루프를 몰고 최종 캡이 backstop」
 #     (claude-telegram-bridge.py:391 주석 · CLB_TYPING_MAX_SECONDS 기본 7200). 새 발명이 아니다.
 #   ★ANSWER_TIMEOUT 은 의미가 바뀌었다 = 진전이 계속돼도 끊는 ★최종 캡. 무한 루프 방지용이라
@@ -797,6 +814,36 @@ def _tui_tool_call_names(rows):
     return names
 
 
+def _tui_tool_in_flight(rows):
+    """아직 tool_result 가 안 온 tool_call 이 있으면 True.
+
+    실측 jsonl: assistant.tool_calls[].id → 이후 type=tool_result.tool_call_id.
+    도구가 돌아가는 동안에는 새 행이 안 붙는다. 그걸 idle(무진전)로 보면
+    긴 셸이 3분에 잘린다(T-260822-053, C 작업 실사고).
+    """
+    pending = set()
+    anonymous_open = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "tool_result":
+            tid = str(row.get("tool_call_id") or "")
+            if tid:
+                pending.discard(tid)
+            elif anonymous_open:
+                anonymous_open -= 1
+            continue
+        for call in row.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            cid = str(call.get("id") or "")
+            if cid:
+                pending.add(cid)
+            else:
+                anonymous_open += 1
+    return bool(pending) or anonymous_open > 0
+
+
 def _tui_paste(prompt):
     """crb 와 같은 tmux 3단(load-buffer → paste-buffer → 제출키).
 
@@ -859,7 +906,7 @@ def run_grok_tui(prompt):
             return str(finals[-1].get("content") or "").strip(), None, session_id
         now = time.time()
         # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
-        if now - last_progress >= TUI_IDLE_TIMEOUT:
+        if now - last_progress >= TUI_IDLE_TIMEOUT and not _tui_tool_in_flight(fresh):
             stop_reason = f"{TUI_IDLE_TIMEOUT}s 동안 새 출력이 없었다(무진전)"
             break
         if now >= hard_deadline:
@@ -908,6 +955,159 @@ def _execute_with_session(chat_id, prompt):
     return answer, cost_usd
 
 
+SUGGESTED_CALLBACK_PREFIX = "grb-sr"
+SUGGESTED_BUTTON_TEXT = "확인"
+SUGGESTED_SENT_BUTTON_TEXT = "✅ 보냄"
+SUGGESTED_DONE_CALLBACK = f"{SUGGESTED_CALLBACK_PREFIX}:done"
+SUGGESTED_STORE_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.suggested.json")
+SUGGESTED_STORE_MAX = 40
+
+
+def _read_suggested_store():
+    try:
+        with open(SUGGESTED_STORE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_suggested_store(store):
+    tmp = SUGGESTED_STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(store, fh, ensure_ascii=False)
+    os.replace(tmp, SUGGESTED_STORE_FILE)
+
+
+def register_suggested_reply(text):
+    """문구를 짧은 id 로 저장한다. Telegram callback_data 는 64바이트 한도."""
+    phrase = (text or "").strip()
+    if not phrase:
+        return ""
+    store = _read_suggested_store()
+    cid = uuid.uuid4().hex[:12]
+    store[cid] = {"text": phrase, "ts": time.time()}
+    if len(store) > SUGGESTED_STORE_MAX:
+        ordered = sorted(store.items(), key=lambda item: float((item[1] or {}).get("ts") or 0))
+        for old_id, _ in ordered[: len(store) - SUGGESTED_STORE_MAX]:
+            store.pop(old_id, None)
+    _write_suggested_store(store)
+    return cid
+
+
+def remember_suggested_message_id(cid, message_id):
+    """버블 발신 후 message_id 를 붙여 둔다. 콜백에 message 가 비어도 버튼을 바꿀 수 있다."""
+    key = str(cid or "")
+    if not key or not message_id:
+        return
+    store = _read_suggested_store()
+    rec = store.get(key)
+    if not isinstance(rec, dict):
+        return
+    try:
+        rec["message_id"] = int(message_id)
+    except (TypeError, ValueError):
+        return
+    store[key] = rec
+    _write_suggested_store(store)
+
+
+def take_suggested_reply(cid):
+    """한 번 쓰면 지운다. (문구, 저장해 둔 message_id) 를 돌려준다."""
+    key = str(cid or "")
+    if not key:
+        return "", None
+    store = _read_suggested_store()
+    rec = store.pop(key, None)
+    if rec is not None:
+        _write_suggested_store(store)
+    if isinstance(rec, dict):
+        mid = rec.get("message_id")
+        return str(rec.get("text") or "").strip(), mid
+    return str(rec or "").strip(), None
+
+
+def suggested_confirm_markup(cid):
+    if not cid:
+        return ""
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [{"text": SUGGESTED_BUTTON_TEXT, "callback_data": f"{SUGGESTED_CALLBACK_PREFIX}:{cid}"}]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def suggested_sent_markup():
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [{"text": SUGGESTED_SENT_BUTTON_TEXT, "callback_data": SUGGESTED_DONE_CALLBACK}]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def mark_suggested_pressed(chat_id, message_id):
+    """눌렀다는 표시 — 버튼을 ✅ 보냄 으로 바꾼다. 실패해도 입력은 이미 넣는다."""
+    if not chat_id or not message_id:
+        return
+    try:
+        res = tg(
+            "editMessageReplyMarkup",
+            timeout=10,
+            chat_id=chat_id,
+            message_id=int(message_id),
+            reply_markup=suggested_sent_markup(),
+        )
+        if not res or not res.get("ok"):
+            print(f"suggested button mark 실패: {res}", file=sys.stderr)
+    except (TypeError, ValueError, Exception) as exc:  # noqa: BLE001
+        print(f"suggested button mark 실패: {exc}", file=sys.stderr)
+
+
+def handle_telegram_callback(callback):
+    """추천답변 확인 버튼. 문구를 그대로 다음 입력으로 넣는다."""
+    cb = callback if isinstance(callback, dict) else {}
+    qid = str(cb.get("id") or "")
+    message = cb.get("message") if isinstance(cb.get("message"), dict) else {}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+
+    def answer(text=""):
+        if not qid:
+            return
+        params = {"callback_query_id": qid}
+        if text:
+            params["text"] = text
+        tg("answerCallbackQuery", timeout=10, **params)
+
+    if str(chat.get("id")) != str(CHAT_ID):
+        answer("이 채팅의 버튼이 아니야")
+        return
+    data = str(cb.get("data") or "")
+    prefix = f"{SUGGESTED_CALLBACK_PREFIX}:"
+    if not data.startswith(prefix):
+        answer("알 수 없는 버튼이야")
+        return
+    if data == SUGGESTED_DONE_CALLBACK:
+        answer()
+        return
+    phrase, stored_mid = take_suggested_reply(data[len(prefix) :])
+    mid = message.get("message_id") or stored_mid
+    if not phrase:
+        answer()
+        mark_suggested_pressed(CHAT_ID, mid)
+        return
+    answer()
+    mark_suggested_pressed(CHAT_ID, mid)
+    inbox_spool(cb.get("id"), "telegram", phrase)
+    print(f">>> [{NAME}] 텔레그램 grok 확인버튼: {phrase[:80]}", flush=True)
+    handle_message_text(phrase, source="telegram")
+
+
 TG_CHUNK = int_env("GRB_TG_CHUNK", 4096, minimum=1)
 
 
@@ -925,7 +1125,7 @@ def _tg_chunks(text, limit):
         yield remaining
 
 
-def deliver_mesh_event(kind, body, *, task_id=None, visibility=None):
+def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None):
     """Send one message straight to the Telegram Bot API.
 
     The maintainer's internal build routes delivery through a private message
@@ -934,14 +1134,21 @@ def deliver_mesh_event(kind, body, *, task_id=None, visibility=None):
     callers read, so nothing downstream has to know which path was taken.
 
     kind/task_id/visibility are accepted and ignored here - they are routing
-    hints for the bus, and there is no bus to route to.
+    hints for the bus, and there is no bus to route to. reply_markup is
+    forwarded on the first chunk only, so a confirm button can sit on the
+    first message of a long answer.
     """
     payload = str(body or "").strip()
     if not payload:
         return {"deliveries": []}
     deliveries = []
+    first = True
     for chunk in _tg_chunks(payload, TG_CHUNK):
-        res = tg("sendMessage", chat_id=CHAT_ID, text=chunk)
+        extra = {}
+        if first and reply_markup:
+            extra["reply_markup"] = reply_markup
+        first = False
+        res = tg("sendMessage", chat_id=CHAT_ID, text=chunk, **extra)
         if not res or not res.get("ok"):
             print(f"telegram sendMessage 실패: {res}", file=sys.stderr)
             deliveries.append({"surface": SEND_SURFACE, "result": "failed"})
@@ -993,7 +1200,6 @@ def mirror_answer(source, text, task_id=None):
     '끝' 이 두 줄 찍히지 않는다.
     """
     local_print(f"grok answer ({source}):\n{text}")
-    # T-260822-041 — 순정: 기본은 마커 분리 없이 원문 1통.
     body, suggested = (
         split_suggested_reply(text) if SUGGESTED_REPLY_SPLIT else (text, "")
     )
@@ -1003,7 +1209,14 @@ def mirror_answer(source, text, task_id=None):
         # 아예 없던 시절이라 본문 첫 chunk 에 👀 를 붙였는데, 그 자리는 규격이
         # 지정한 대상이 아니다(대상 = 추천답변 버블의 첫 message_id).
         return
-    bubble = deliver_mesh_event("copy_content", suggested, task_id=task_id)
+    cid = register_suggested_reply(suggested)
+    bubble = deliver_mesh_event(
+        "copy_content",
+        suggested,
+        task_id=task_id,
+        reply_markup=suggested_confirm_markup(cid),
+    )
+    remember_suggested_message_id(cid, _first_sent_message_id(bubble))
     set_eyes_reaction(CHAT_ID, _first_sent_message_id(bubble))
 
 
@@ -1060,6 +1273,435 @@ def handle_message_text(text, source="telegram"):
     health_mark(last_enqueue_at=time.time(), enqueued=1)
 
 
+def safe_filename_part(value):
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in str(value or ""))
+    return cleaned.strip("-")[:80] or "file"
+
+
+def suffix_from_metadata(file_name="", mime_type="", default=".bin"):
+    suffix = os.path.splitext(file_name or "")[1].lower()
+    if suffix:
+        return suffix
+    guessed = mimetypes.guess_extension(mime_type or "")
+    return guessed.lower() if guessed else default
+
+
+def format_metadata(metadata):
+    parts = []
+    for key, value in (metadata or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        parts.append(f"{key}={value}")
+    return "; ".join(parts)
+
+
+def media_output_dir():
+    return os.path.join(STATE_DIR, "grok-telegram-bridge-media", NAME)
+
+
+def download_file(file_id, output_dir, name_hint, default_suffix=".bin", allowed_extensions=None):
+    """Telegram getFile → 로컬 저장. clb download_file 과 같은 청크·재시도 계약."""
+    payload = tg("getFile", file_id=file_id)
+    if not payload or not payload.get("ok") or not isinstance(payload.get("result"), dict):
+        raise RuntimeError("Telegram getFile failed")
+    file_path = str(payload["result"].get("file_path") or "")
+    if not file_path:
+        raise RuntimeError("Telegram getFile returned empty file_path")
+
+    suffix = os.path.splitext(file_path)[1].lower() or default_suffix
+    if allowed_extensions is not None and suffix not in allowed_extensions:
+        suffix = default_suffix
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{safe_filename_part(name_hint)}{suffix}")
+
+    quoted_path = urllib.parse.quote(file_path, safe="/")
+    request = urllib.request.Request(f"https://api.telegram.org/file/bot{TOKEN}/{quoted_path}")
+    last_err = None
+    for attempt in range(3):
+        try:
+            buf = bytearray()
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_ATTEMPT_TIMEOUT) as response:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+            with open(output_path, "wb") as fh:
+                fh.write(bytes(buf))
+            return output_path
+        except (OSError, http.client.HTTPException) as err:
+            last_err = err
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"file download failed after 3 attempts: {last_err}")
+
+
+def transcribe_audio(media_path):
+    template = AUDIO_TRANSCRIBE_CMD
+    if not template:
+        return "", "not_available: set GRB_AUDIO_TRANSCRIBE_CMD to enable audio transcription"
+    quoted_path = shlex.quote(str(media_path))
+    cmd = template.replace("{path}", quoted_path) if "{path}" in template else f"{template} {quoted_path}"
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=AUDIO_TRANSCRIBE_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return "", f"failed: transcription timed out after {AUDIO_TRANSCRIBE_TIMEOUT}s"
+    except OSError as exc:
+        return "", f"failed: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        suffix = f": {detail[-1][:200]}" if detail else ""
+        return "", f"failed: transcription command rc={proc.returncode}{suffix}"
+    transcript = (proc.stdout or "").strip()
+    if not transcript:
+        return "", "failed: transcription command returned empty stdout"
+    return transcript[:12000], "ok"
+
+
+def image_prompt_text(caption_text, image_path, metadata):
+    lines = [
+        "[Telegram image received]",
+        f"local_path: {image_path}",
+    ]
+    if caption_text:
+        lines.append(f"caption: {caption_text}")
+    metadata_line = format_metadata(metadata)
+    if metadata_line:
+        lines.append(f"metadata: {metadata_line}")
+    lines.extend(
+        [
+            "",
+            "Open the local image path, inspect it, and answer the Telegram user in Korean. "
+            "Keep the answer concise and useful.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def audio_prompt_text(media_kind, caption_text, media_path, metadata, transcript, transcript_status):
+    lines = [
+        "[Telegram audio received]",
+        f"local_path: {media_path}",
+        f"media_kind: {media_kind}",
+    ]
+    if caption_text:
+        lines.append(f"caption: {caption_text}")
+    metadata_line = format_metadata(metadata)
+    if metadata_line:
+        lines.append(f"metadata: {metadata_line}")
+    lines.append("")
+    if transcript:
+        lines.extend(["transcript:", transcript])
+    else:
+        lines.append(f"transcript_status: {transcript_status}")
+    lines.extend(
+        [
+            "",
+            "Answer the Telegram user in Korean. If transcript is unavailable, say the audio file "
+            "was received and ask for text or GRB_AUDIO_TRANSCRIBE_CMD setup when needed.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def video_prompt_text(
+    media_kind,
+    caption_text,
+    media_path,
+    metadata,
+    thumbnail_path,
+    transcript,
+    transcript_status,
+):
+    lines = [
+        "[Telegram video received]",
+        f"local_path: {media_path}",
+        f"media_kind: {media_kind}",
+    ]
+    if thumbnail_path:
+        lines.append(f"thumbnail_path: {thumbnail_path}")
+    if caption_text:
+        lines.append(f"caption: {caption_text}")
+    metadata_line = format_metadata(metadata)
+    if metadata_line:
+        lines.append(f"metadata: {metadata_line}")
+    lines.append("")
+    if transcript:
+        lines.extend(["audio_transcript:", transcript])
+    else:
+        lines.append(f"audio_transcript_status: {transcript_status}")
+    lines.extend(
+        [
+            "",
+            "Open thumbnail_path with the local image tool if present. Answer the Telegram user "
+            "in Korean based on the local video path, thumbnail, caption, metadata, and transcript. "
+            "If the video cannot be inspected directly, state that limitation briefly.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def document_prompt_text(caption_text, media_path, metadata):
+    lines = [
+        "[Telegram file received]",
+        f"local_path: {media_path}",
+        "media_kind: document",
+    ]
+    if caption_text:
+        lines.append(f"caption: {caption_text}")
+    metadata_line = format_metadata(metadata)
+    if metadata_line:
+        lines.append(f"metadata: {metadata_line}")
+    lines.extend(
+        [
+            "",
+            "Answer the Telegram user in Korean. Use the local_path and metadata above. "
+            "If the file cannot be inspected directly, say that the file was received and "
+            "ask for the specific action needed.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def download_thumbnail(media, media_dir, update_id):
+    thumbnail = media.get("thumbnail") or media.get("thumb")
+    if not isinstance(thumbnail, dict) or not thumbnail.get("file_id"):
+        return None
+    name_hint = f"telegram-video-thumb-{update_id}-{thumbnail.get('file_unique_id') or thumbnail.get('file_id')}"
+    try:
+        return download_file(
+            str(thumbnail["file_id"]),
+            media_dir,
+            name_hint,
+            default_suffix=".jpg",
+            allowed_extensions=IMAGE_EXTENSIONS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"thumbnail download failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _pick_largest_photo(photos):
+    candidates = [item for item in photos if isinstance(item, dict) and item.get("file_id")]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (
+            int(item.get("file_size") or 0),
+            int(item.get("width") or 0) * int(item.get("height") or 0),
+        ),
+    )
+
+
+def prompt_from_telegram_message(message, update_id):
+    """글이면 본문, 미디어면 로컬 경로 프롬프트. clb prompt_from_telegram_message 동형(위치공유 제외)."""
+    raw_text = message.get("text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text
+
+    caption = message.get("caption")
+    caption_text = caption.strip() if isinstance(caption, str) else ""
+    dest = media_output_dir()
+
+    try:
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            photo = _pick_largest_photo(photos)
+            if photo:
+                name_hint = f"telegram-{update_id}-{photo.get('file_unique_id') or photo.get('file_id')}"
+                image_path = download_file(
+                    str(photo["file_id"]),
+                    dest,
+                    name_hint,
+                    default_suffix=".jpg",
+                    allowed_extensions=IMAGE_EXTENSIONS,
+                )
+                return image_prompt_text(
+                    caption_text,
+                    image_path,
+                    {
+                        "width": photo.get("width"),
+                        "height": photo.get("height"),
+                        "file_size": photo.get("file_size"),
+                    },
+                )
+
+        document = message.get("document") if isinstance(message.get("document"), dict) else None
+
+        if document and str(document.get("mime_type") or "").startswith("image/"):
+            file_id = str(document.get("file_id") or "")
+            if file_id:
+                name_hint = f"telegram-{update_id}-{document.get('file_unique_id') or file_id}"
+                default_suffix = suffix_from_metadata(
+                    str(document.get("file_name") or ""),
+                    str(document.get("mime_type") or ""),
+                    ".jpg",
+                )
+                image_path = download_file(
+                    file_id,
+                    dest,
+                    name_hint,
+                    default_suffix=default_suffix,
+                    allowed_extensions=IMAGE_EXTENSIONS,
+                )
+                return image_prompt_text(
+                    caption_text,
+                    image_path,
+                    {
+                        "mime_type": document.get("mime_type"),
+                        "file_name": document.get("file_name"),
+                        "file_size": document.get("file_size"),
+                    },
+                )
+
+        audio = None
+        audio_kind = ""
+        for key, kind in (("voice", "voice"), ("audio", "audio")):
+            candidate = message.get(key)
+            if isinstance(candidate, dict) and candidate.get("file_id"):
+                audio = candidate
+                audio_kind = kind
+                break
+        if audio is None and document and document.get("file_id"):
+            mime_type = str(document.get("mime_type") or "")
+            file_name = str(document.get("file_name") or "")
+            if mime_type.startswith("audio/") or os.path.splitext(file_name)[1].lower() in AUDIO_EXTENSIONS:
+                audio = document
+                audio_kind = "audio_document"
+        if audio is not None:
+            file_id = str(audio.get("file_id") or "")
+            name_hint = f"telegram-{update_id}-{audio.get('file_unique_id') or file_id}"
+            default_suffix = suffix_from_metadata(
+                str(audio.get("file_name") or ""),
+                str(audio.get("mime_type") or ""),
+                ".ogg" if audio_kind == "voice" else ".mp3",
+            )
+            media_path = download_file(
+                file_id,
+                dest,
+                name_hint,
+                default_suffix=default_suffix,
+                allowed_extensions=AUDIO_EXTENSIONS,
+            )
+            transcript, transcript_status = transcribe_audio(media_path)
+            return audio_prompt_text(
+                audio_kind,
+                caption_text,
+                media_path,
+                {
+                    "duration": audio.get("duration"),
+                    "mime_type": audio.get("mime_type"),
+                    "file_name": audio.get("file_name"),
+                    "title": audio.get("title"),
+                    "performer": audio.get("performer"),
+                    "file_size": audio.get("file_size"),
+                },
+                transcript,
+                transcript_status,
+            )
+
+        video = None
+        video_kind = ""
+        for key, kind in (("video", "video"), ("video_note", "video_note"), ("animation", "animation")):
+            candidate = message.get(key)
+            if isinstance(candidate, dict) and candidate.get("file_id"):
+                video = candidate
+                video_kind = kind
+                break
+        if video is None and document and document.get("file_id"):
+            mime_type = str(document.get("mime_type") or "")
+            file_name = str(document.get("file_name") or "")
+            if mime_type.startswith("video/") or os.path.splitext(file_name)[1].lower() in VIDEO_EXTENSIONS:
+                video = document
+                video_kind = "video_document"
+        if video is not None:
+            file_id = str(video.get("file_id") or "")
+            name_hint = f"telegram-{update_id}-{video.get('file_unique_id') or file_id}"
+            default_suffix = suffix_from_metadata(
+                str(video.get("file_name") or ""),
+                str(video.get("mime_type") or ""),
+                ".mp4",
+            )
+            media_path = download_file(
+                file_id,
+                dest,
+                name_hint,
+                default_suffix=default_suffix,
+                allowed_extensions=VIDEO_EXTENSIONS,
+            )
+            thumbnail_path = download_thumbnail(video, dest, update_id)
+            transcript, transcript_status = transcribe_audio(media_path)
+            return video_prompt_text(
+                video_kind,
+                caption_text,
+                media_path,
+                {
+                    "duration": video.get("duration"),
+                    "mime_type": video.get("mime_type"),
+                    "file_name": video.get("file_name"),
+                    "width": video.get("width") or video.get("length"),
+                    "height": video.get("height") or video.get("length"),
+                    "file_size": video.get("file_size"),
+                },
+                thumbnail_path,
+                transcript,
+                transcript_status,
+            )
+
+        if document and document.get("file_id"):
+            file_id = str(document.get("file_id") or "")
+            name_hint = f"telegram-{update_id}-{document.get('file_unique_id') or file_id}"
+            default_suffix = suffix_from_metadata(
+                str(document.get("file_name") or ""),
+                str(document.get("mime_type") or ""),
+                ".bin",
+            )
+            media_path = download_file(
+                file_id,
+                dest,
+                name_hint,
+                default_suffix=default_suffix,
+            )
+            return document_prompt_text(
+                caption_text,
+                media_path,
+                {
+                    "mime_type": document.get("mime_type"),
+                    "file_name": document.get("file_name"),
+                    "file_size": document.get("file_size"),
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"telegram media download 실패: {exc}", file=sys.stderr)
+        if caption_text:
+            return caption_text
+        raise
+
+    return caption_text
+
+
+def telegram_prompt_from_update(upd):
+    """폴러가 쓰는 진입점. 글·미디어를 한 경로로 돌려준다. 해당 챗이 아니면 빈 문자열."""
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg:
+        return ""
+    if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+        return ""
+    try:
+        return (prompt_from_telegram_message(msg, upd.get("update_id")) or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"telegram media 처리 실패: {exc}", file=sys.stderr)
+        return ""
+
+
 def telegram_poller():
     offset = _read(OFFSET_FILE)
     offset = int(offset) if offset.isdigit() else 0
@@ -1073,17 +1715,17 @@ def telegram_poller():
             continue
         for upd in res.get("result", []):
             try:
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
+                callback = upd.get("callback_query")
+                if callback:
+                    handle_telegram_callback(callback)
                     continue
-                if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
-                    continue
-                text = msg.get("text")
+                text = telegram_prompt_from_update(upd)
                 if not text:
                     continue
                 # ★내구화 먼저, offset 전진은 finally 에서 — 순서가 유실 축의 전부다.
                 inbox_spool(upd.get("update_id"), "telegram", text)
-                print(f">>> [{NAME}] 텔레그램 grok: {text.strip()}", flush=True)
+                preview = text.strip().splitlines()[0][:80]
+                print(f">>> [{NAME}] 텔레그램 grok: {preview}", flush=True)
                 handle_message_text(text, source="telegram")
             except Exception as exc:  # noqa: BLE001
                 print(f"telegram update 처리 실패: {exc}", file=sys.stderr)
