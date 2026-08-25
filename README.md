@@ -46,14 +46,32 @@ the machine at home:
 | `what changed in my project today?` | Grok runs `git log` on your machine and summarizes it |
 | `fix the typo in README.md line 4` | Grok edits the actual file |
 | `is the server still up?` | Grok runs the check and reports back |
+| a photo, voice note, video, or file | the bridge saves it locally and hands Grok the path |
 | a plain question | Grok just answers, no tools involved |
-
-Only the finished answer is sent back — you do not get a wall of tool output on
-your phone.
 
 The conversation keeps its thread. The bridge remembers which Grok session
 belongs to your chat, so a follow-up like "now do the same for the other file"
 still makes sense.
+
+## What Comes Back To Your Phone
+
+You do not get a wall of tool output. What you do get:
+
+- **The finished answer**, as one or more Telegram messages.
+- **Copy-paste command bubbles.** If the answer includes a command you are
+  meant to run yourself, that command is sent as its own message with Telegram's
+  copy button, not buried in the prose.
+- **A suggested-reply bubble.** If the answer ends with a trailing suggestion
+  marker, that suggestion is a second message with a confirm button. Pressing
+  the button sends the suggestion back into the same Grok session.
+- **One progress line, edited in place** (TUI lane). While a long turn is still
+  running, the phone shows a single status message that gets rewritten, instead
+  of a new bubble every minute.
+
+If a turn overruns the wait, or the bridge restarts while Grok is still
+writing, a late answer is recovered instead of being thrown away. A photo that
+was sitting on the clipboard is no longer pasted into Grok just because you
+sent a text message.
 
 ## What You Need
 
@@ -164,6 +182,11 @@ messages are typed into it. You can attach to that session on the machine
 (`tmux attach`) and watch what is happening in real time, which is the reason to
 prefer it — a headless run is invisible while it works.
 
+In the TUI lane, send `/clear` or `/new` to start a fresh session. The bridge
+rebuilds the tmux pane; it does not paste those words into Grok. If you also
+type into that tmux session on the machine and want those turns on your phone,
+set `GRB_TUI_MIRROR_LOCAL=1`.
+
 Tool access is identical in both lanes. Neither one restricts what Grok may do.
 
 ## Settings
@@ -174,8 +197,11 @@ Every setting is an environment variable. Only the first two are required.
 | --- | --- | --- |
 | `GRB_TOKEN_FILE` | — | Path to the JSON file holding your bot token. Required. |
 | `GRB_CHAT_ID` | — | The one Telegram chat id allowed to reach this machine. Required. |
+| `GRB_CHAT_LANE` | `headless` | `headless` or `tui`. See "Two Lanes" above. |
 | `GRB_GROK_BIN` | `grok` | Path to the `grok` binary, if it is not on your `PATH`. |
-| `GRB_GROK_TIMEOUT` | `180` | Seconds to wait for one turn before giving up. |
+| `GRB_GROK_TIMEOUT` | `180` | Headless lane: seconds to wait for one turn before giving up. |
+| `GRB_TUI_ANSWER_TIMEOUT` | `180` (example env) | TUI lane: seconds to wait for one turn. Raise this for long jobs. |
+| `GRB_TUI_MIRROR_LOCAL` | `0` | TUI lane: set `1` to also send turns typed in the tmux session to Telegram. |
 | `GRB_STATE_DIR` | `~/.grok-telegram-bridge/state` | Where the chat-to-session mapping is kept. |
 | `GRB_GROK_DISALLOWED_TOOLS` | empty | Comma-separated tool ids to take away from Grok. Empty means **no restriction**. See below. |
 | `GRB_GROK_CHAT_RULES` | a work-lane rule | Extra instructions prepended to every turn. |
@@ -218,8 +244,15 @@ so there is no error to see.
 
 **It answers, but very slowly, or times out at 180 seconds.**
 Grok is probably investigating with tools rather than just answering. Either
-raise `GRB_GROK_TIMEOUT`, or narrow the job — "read file X and tell me Y" is
-faster than "figure out what is wrong".
+raise `GRB_GROK_TIMEOUT` (headless) or `GRB_TUI_ANSWER_TIMEOUT` (TUI), or
+narrow the job — "read file X and tell me Y" is faster than "figure out what
+is wrong". If the answer lands after the wait, the bridge still tries to send
+it rather than dropping it.
+
+**A text message pulled in a photo you did not send.**
+That was a real bug: leftover clipboard media could ride along with a text
+paste. Current builds strip that. Restart the bridge if an older process is
+still running.
 
 **`grok: command not found`.**
 The bridge could not find the CLI. Point `GRB_GROK_BIN` at the full path, e.g.

@@ -59,18 +59,16 @@ the export script's own dangling-helper gate fails if any bus helper reference
 survives. Step 1 covers this; there is nothing extra to run here.
 
 6. Confirm the chat id has no default. This is the leak that blocked the first
-release attempt (T-260822-014):
+release attempt (T-260822-014). The public module exits at import if the chat
+id is unset, so do not probe this by importing the file. Probe the source:
 
 ```bash
-GRB_DRY_RUN=1 python3 - <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location(
-    "grok_telegram_bridge", "dist/grok-telegram-bridge/grok_telegram_bridge.py")
-mod = importlib.util.module_from_spec(spec); sys.modules[spec.name] = mod
-spec.loader.exec_module(mod)
-assert mod.CHAT_ID == "", f"chat id default leaked: {mod.CHAT_ID!r}"
-print("chat id default is empty: ok")
-PY
+grep -q 'env("GRB_CHAT_ID", "")' dist/grok-telegram-bridge/grok_telegram_bridge.py
+# expected: exit 0
+if grep -qE 'env\("GRB_CHAT_ID", "[0-9]' dist/grok-telegram-bridge/grok_telegram_bridge.py; then
+  echo "numeric chat id default leaked" >&2; exit 1
+fi
+echo "chat id default is empty: ok"
 ```
 
 7. Re-read README billing language. It must say billing classification is

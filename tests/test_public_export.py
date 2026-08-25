@@ -92,6 +92,22 @@ class PublicExportTest(unittest.TestCase):
         with mock.patch.object(mod, "tg", lambda *a, **k: self.fail("must not send")):
             self.assertEqual(mod.deliver_mesh_event("final", "   "), {"deliveries": []})
 
+    def test_code_entity_sends_pre_markup(self):
+        """T-260825-002 — 새 키워드를 스텁이 받아 pre entity 로 넘긴다 (PR#1935 클래스)."""
+        mod = load_bridge("grb_code_entity")
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": {"message_id": 7}},
+        ):
+            mod.deliver_mesh_event(
+                "copy_content", "git pull --ff-only", telegram_code_entity=True
+            )
+        self.assertEqual(calls[0][0], "sendMessage")
+        self.assertIn("entities", calls[0][1])
+
     def test_trailing_suggested_reply_is_split(self):
         mod = load_bridge("grb_suggested")
         open_m = "<" + "추천답변" + ">"

@@ -12,7 +12,7 @@
 
   보는 축:  cwd · deny 목록 · no-subagents · disable-web-search · permission-mode · model
             · rules 지문(sha256 앞 12자 — 원문은 길고 따옴표 처리가 양쪽에서 달라 지문으로 잰다)
-  안 보는 축: session-id (신규 대화 예약값이라 매 기동 달라진다)
+  안 보는 축: session-id · resume (같은 대화 열쇠의 다른 플래그, T-260823-024)
 
 exit: 0 = 동일 · 1 = 드리프트(축 목록을 stdout 에 출력) · 2 = 판정 불가/사용법 오류
 """
@@ -24,9 +24,9 @@ import hashlib
 import shlex
 import sys
 
-VOLATILE_FLAGS = {"--session-id"}
+VOLATILE_FLAGS = {"--session-id", "--resume"}
 VALUE_FLAGS = {
-    "--cwd", "--session-id", "--rules", "--permission-mode", "-m", "--model", "--deny",
+    "--cwd", "--session-id", "--resume", "--rules", "--permission-mode", "-m", "--model", "--deny",
 }
 
 

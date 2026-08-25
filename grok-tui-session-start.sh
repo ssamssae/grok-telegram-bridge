@@ -30,6 +30,7 @@
 #   grok-tui-session-start.sh              # 없으면 기동, 있으면 그대로 둔다(멱등)
 #   grok-tui-session-start.sh --print-cmd  # 조립될 grok argv 만 출력 (tmux 미접촉)
 #   grok-tui-session-start.sh --print-cmd0 # 같은 argv 를 ★NUL 구분으로 (인자 경계 보존)
+#   grok-tui-session-start.sh --print-session-dir # 이 기동이 쓸 세션 디렉토리 (경로 축 진단용, T-260824-031)
 #   grok-tui-session-start.sh --print-name # 해석된 GRB_NAME 만 출력 (상태파일 축 진단용)
 #   grok-tui-session-start.sh --force      # 기존 세션을 죽이고 새로 기동
 #
@@ -50,7 +51,9 @@ DRIFT_EXIT="${GRB_TUI_DRIFT_EXIT:-9}"
 STATE_DIR="${GRB_STATE_DIR:-$HOME/.grok-telegram-bridge/state}"
 GROK_BIN="${GRB_GROK_BIN:-grok}"
 TMUX_BIN="${GRB_TMUX_BIN:-tmux}"
-TMUX_SOCKET="${GRB_TMUX_SOCKET:-grok}"
+# T-260823-024: 배차(grok-directive.sh 기본 소켓)·TUI·gg 가 한 창이다.
+# 옛 기본값 `grok`(-L grok) 는 재부팅 후 배차 무착지 근인이었다.
+TMUX_SOCKET="${GRB_TMUX_SOCKET:-default}"
 TMUX_SESSION="${GRB_TMUX_SESSION:-grok}"
 # T-260822-047 — --force 경로 전용 노브. 기본값은 「사람이 못 느끼는 상한」으로 잡았다.
 NEW_SESSION_TRIES="${GRB_TUI_NEW_SESSION_TRIES:-3}"
@@ -101,9 +104,10 @@ case "${1:-}" in
   --print-cmd)  MODE="print" ;;
   --print-cmd0) MODE="print0" ;;
   --print-name) MODE="name" ;;
+  --print-session-dir) MODE="sessiondir" ;;
   --force)      MODE="force" ;;
   "")           MODE="run" ;;
-  *) echo "usage: $(basename "$0") [--print-cmd|--print-name|--force]" >&2; exit 2 ;;
+  *) echo "usage: $(basename "$0") [--print-cmd|--print-name|--print-session-dir|--force]" >&2; exit 2 ;;
 esac
 
 if [ "$MODE" = "name" ]; then
@@ -118,16 +122,15 @@ session_alive() {
 }
 
 # ── ④ 멱등 판정은 ★상태파일이 아니라 tmux 세션 실존이다 (제어 노드 실측 ④) ──────────
-#   종전엔 상태파일에 uuid 가 있으면 그걸 그대로 --session-id 로 다시 넣었다. 그런데
 #   `--session-id` 는 ★신규 대화 전용이다(grok --help: "Does not resume existing
-#   sessions"). 세션이 죽고 상태파일만 남은 조합에서 재기동하면 이미 존재하는 id 를
-#   신규로 예약하려 들어 grok 이 즉사하고 tmux 서버째 사라졌다("no server running" 실측)
-#   → 다음 왕복이 180s 무응답. 그래서 ★세션을 새로 세울 때는 uuid 도 새로 발급한다.
+#   sessions"). 죽은 세션의 uuid 를 --session-id 로 다시 넣으면 grok 이 즉사한다.
+#   ★세션이 살아 있으면 파일 uuid 가 그 창의 키. ★세션이 없고 파일 uuid 가 있으면
+#   같은 대화를 `--resume` 로 되살린다 (T-260823-024 / T-260823-016 옆길 uuid 금지).
+#   파일도 없을 때만 신규 uuid + --session-id.
 resolve_session_id() {
   # 명시 주입은 그대로 존중한다(테스트·운영자 의도).
   if [ -n "${GRB_TUI_SESSION_ID:-}" ]; then printf '%s' "$GRB_TUI_SESSION_ID"; return 0; fi
-  # 세션이 살아 있으면 상태파일 uuid 가 ★그 세션의 키다 — 재사용이 맞다.
-  if [ "$MODE" != "force" ] && session_alive && [ -f "$SESSION_ID_FILE" ]; then
+  if [ "$MODE" != "force" ] && [ -f "$SESSION_ID_FILE" ]; then
     local sid; sid="$(tr -d '[:space:]' < "$SESSION_ID_FILE" 2>/dev/null)"
     if [ -n "$sid" ]; then printf '%s' "$sid"; return 0; fi
   fi
@@ -135,6 +138,53 @@ resolve_session_id() {
 }
 
 SESSION_ID="$(resolve_session_id)" || { echo "session uuid 생성 실패" >&2; exit 2; }
+# ⚠️ 제거 금지 (DO NOT REMOVE) — `--resume` 은 ★되살릴 대화가 실재할 때만이다 (T-260824-029).
+#   T-260823-024 가 "세션이 죽고 파일 uuid 가 있으면 --resume 으로 되살린다" 로 바꿨는데
+#   그 uuid 의 세션이 ★디스크에 있는지는 안 봤다. 상태파일만 남고 폴더가 없으면
+#   되살릴 대상이 없어 grok 이 즉사한다 — 종전 주석이 경고하던 바로 그 즉사 경로가
+#   방향만 바뀐 채 남아 있었다.
+#   test_dead_session_with_stale_state_mints_a_new_uuid 가 이걸 정확히 잡고 있었고,
+#   ★그 픽스처는 그 뒤로 계속 적색이었다(오늘 origin/main 대조군 2회 확인). 같은 커밋이
+#   gg 의 소켓도 남겨뒀다(T-260824-003) — 한 커밋이 두 표면을 남긴 형태다.
+#
+#   판정: 파일 uuid 의 세션 폴더가 있으면 --resume(대화 이어받기, 종전 의도 보존),
+#         없으면 신규 uuid + --session-id(되살릴 게 없으니 새로 연다).
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 세션 경로 계산은 ★여기 한 곳이다 (T-260824-031).
+#   그록 세션 디렉토리는 cwd 를 urlquote 해서 만든다. 쓰는 쪽(그록 TUI)은 cwd 를
+#   ★realpath 로 정규화하므로, 읽는 쪽이 논리경로(예: macOS 의 /tmp·/var 심링크)를
+#   쓰면 문자열만 다른 ★서로 다른 폴더를 본다 — 증상은 언제나 「답은 화면에 났는데
+#   브릿지는 무응답」이다. 이 클래스는 오늘만 3회 재발했다:
+#     T-260819-028(라이브, /tmp) · T-260824-028 픽스처 · T-260824-029 픽스처(pwd vs pwd -P)
+#   그래서 규칙을 복제하지 않는다. 어긋남은 test_grok_session_path_realpath.sh 가 잡는다.
+#   ★$CHAT_CWD 는 이 파일 위쪽에서 이미 정규화된 값이다(realpath 계약).
+grok_session_dir_for() {
+  local sid="${1:-}"
+  printf '%s/sessions/%s/%s' \
+    "$(grok_home_effective)" \
+    "$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$CHAT_CWD" 2>/dev/null)" \
+    "$sid"
+}
+
+_session_dir_exists() {
+  local sid="${1:-}"
+  [ -n "$sid" ] || return 1
+  [ -d "$(grok_session_dir_for "$sid")" ]
+}
+
+RESUME_EXISTING=0
+if [ "$MODE" != "force" ] && ! session_alive && [ -f "$SESSION_ID_FILE" ]; then
+  _file_sid="$(tr -d '[:space:]' < "$SESSION_ID_FILE" 2>/dev/null || true)"
+  if [ -n "$_file_sid" ] && [ "$SESSION_ID" = "$_file_sid" ]; then
+    if _session_dir_exists "$_file_sid"; then
+      RESUME_EXISTING=1
+    else
+      # 되살릴 대화가 없다 — 옛 uuid 를 재투입하지 않고 새로 연다.
+      echo "[grok-tui] 상태파일 uuid($_file_sid)의 세션이 디스크에 없다 — 새 uuid 로 연다" >&2
+      SESSION_ID="$(python3 -c 'import uuid;print(uuid.uuid4())')" || { echo "session uuid 생성 실패" >&2; exit 2; }
+    fi
+  fi
+  unset _file_sid
+fi
 
 # ── T-260821-039: 도구 차단축 폐기 (사용자 직접 지시) ────────────────────────
 # 종전 이 자리에는 `⚠️ 제거 금지 (DO NOT REMOVE)` 가드 마커와 DENY_PREFIXES 가 있었다.
@@ -157,7 +207,11 @@ SESSION_ID="$(resolve_session_id)" || { echo "session uuid 생성 실패" >&2; e
 # --no-subagents · --disable-web-search 도 같이 걷는다. 목표가 「clb·crb 급 작업 레인」이라
 #   서브에이전트·웹검색이 막혀 있으면 손발이 반만 붙는다. 복원은 아래 CMD 뒤에
 #   `--no-subagents --disable-web-search` 를 다시 붙이면 된다.
-CMD=("$GROK_BIN" --cwd "$CHAT_CWD" --session-id "$SESSION_ID")
+if [ "$RESUME_EXISTING" = "1" ]; then
+  CMD=("$GROK_BIN" --cwd "$CHAT_CWD" --resume "$SESSION_ID")
+else
+  CMD=("$GROK_BIN" --cwd "$CHAT_CWD" --session-id "$SESSION_ID")
+fi
 [ -n "$CHAT_RULES" ] && CMD+=(--rules "$CHAT_RULES")
 [ -n "${GRB_TUI_PERMISSION_MODE:-}" ] && CMD+=(--permission-mode "$GRB_TUI_PERMISSION_MODE")
 [ -n "${GRB_TUI_MODEL:-}" ] && CMD+=(-m "$GRB_TUI_MODEL")
@@ -172,6 +226,16 @@ fi
 #   그 오독으로 상시 경고를 내면 경고는 곧 무시된다 — 그래서 NUL 구분 출력을 따로 둔다.
 if [ "$MODE" = "print0" ]; then
   printf '%s\0' ${CMD[@]+"${CMD[@]}"}
+  exit 0
+fi
+
+# ★세션 경로 전용 관측점 (T-260824-031). tmux 미접촉.
+#   「쓰는 쪽과 읽는 쪽이 다른 폴더를 본다」는 이 클래스는 오늘만 3회 재발했고
+#   그때마다 사람이 눈으로 잡았다. 기계가 대조하려면 값을 내주는 입구가 있어야 한다.
+#   test_grok_session_path_realpath.sh 가 이 출력과 브릿지 계산값을 맞대 본다.
+if [ "$MODE" = "sessiondir" ]; then
+  grok_session_dir_for "$SESSION_ID"
+  printf '\n'
   exit 0
 fi
 
@@ -198,6 +262,7 @@ running_session_cmd() {
   printf '%s' "$out"
 }
 
+REUSE_SESSION=0
 if session_alive; then
   if [ "$MODE" != "force" ]; then
     echo "[grok-tui] 이미 떠 있다 — session=$TMUX_SESSION socket=$TMUX_SOCKET (uuid=$(cat "$SESSION_ID_FILE" 2>/dev/null))"
@@ -227,7 +292,19 @@ if session_alive; then
          exit 0 ;;
     esac
   fi
-  "$TMUX_BIN" -L "$TMUX_SOCKET" kill-session -t "$TMUX_SESSION" 2>/dev/null
+  # ⚠️ 제거 금지 (DO NOT REMOVE) — 세션을 ★죽이지 않는다 (T-260824-001).
+  #   종전엔 여기서 kill-session 을 했고, 그러면 그 세션에 ★붙어 있던 클라이언트가
+  #   같이 끊긴다. 사용자가 폰에서 /clear 를 치면 Ghostty 그록 창이 exit 친 것처럼
+  #   터미널로 튕겨 나갔다 — 브릿지의 /clear 경로가 이 --force 를 부르기 때문이다
+  #   (grok-telegram-bridge.py restart_tui_session).
+  #   대신 아래 기동 블록에서 respawn-window 로 ★같은 세션의 창만 갈아끼운다.
+  #   세션이 살아 있으면 붙어 있던 클라이언트도 그대로 남는다.
+  #   되돌리기 = GRB_TUI_FORCE_KILL_SESSION=1 (종전 kill+new 경로 그대로).
+  if [ "${GRB_TUI_FORCE_KILL_SESSION:-0}" = "1" ]; then
+    "$TMUX_BIN" -L "$TMUX_SOCKET" kill-session -t "$TMUX_SESSION" 2>/dev/null
+  else
+    REUSE_SESSION=1
+  fi
   # ★정착 대기(kill 후 has-session 이 죽을 때까지 폴링)를 ★넣지 않았다 — 측정 근거:
   #   ①경합을 21회 시도해 0회 재현했다(bare tmux 8 · 즉사 payload 2 · 클라이언트 부착 5 ·
   #     런처 실기동 6) ⇒ 이 대기가 무엇을 막는지 보일 방법이 없다.
@@ -249,8 +326,27 @@ printf '%s' "$CHAT_CWD" > "$CWD_FILE" || exit 2
 #   클라이언트 부착 5 · 런처 실기동 6). 근인을 모르는 채로도 이 수리는 성립한다:
 #   고치는 대상이 「왜 실패하는가」가 아니라 ★「실패했을 때 아무것도 안 남는 것」이기 때문이다.
 #   되돌리려면 retries 를 1 로 두면 종전 동작이다(GRB_TUI_NEW_SESSION_TRIES=1).
+# ★붙어 있는 클라이언트를 지키는 경로 (T-260824-001).
+#   respawn-window 는 세션·창을 그대로 두고 그 안의 프로세스만 갈아끼운다.
+#   그래서 Ghostty 가 붙어 있어도 안 끊긴다 — /clear 가 창을 밖으로 뱉던 축.
+#   ★env 는 대물림되지 않는다: new-session 은 이 프로세스 env 를 물려받지만
+#   respawn-window 는 서버 env 를 쓴다. GROK_HOME 은 -e 로 명시해 넘긴다
+#   (lib/grok-home.sh 가 override 를 준 경우에만 잡힌다 = 무회귀).
+#   실패하면 조용히 넘어가지 않고 종전 kill+new 로 떨어진다.
+if [ "$REUSE_SESSION" = "1" ]; then
+  _rw=("$TMUX_BIN" -L "$TMUX_SOCKET" respawn-window -k -t "$TMUX_SESSION" -c "$CHAT_CWD")
+  [ -n "${GROK_HOME:-}" ] && _rw+=(-e "GROK_HOME=$GROK_HOME")
+  if "${_rw[@]}" ${CMD[@]+"${CMD[@]}"} 2>/dev/null; then
+    echo "[grok-tui] 창만 갈아끼웠다 (세션 유지 — 붙어 있던 화면 안 끊김)"
+  else
+    echo "[grok-tui] ⚠️ respawn-window 실패 — 종전 kill+new 로 떨어진다" >&2
+    "$TMUX_BIN" -L "$TMUX_SOCKET" kill-session -t "$TMUX_SESSION" 2>/dev/null
+    REUSE_SESSION=0
+  fi
+fi
+
 _ns_try=1
-while :; do
+while [ "$REUSE_SESSION" != "1" ]; do
   if "$TMUX_BIN" -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$CHAT_CWD" ${CMD[@]+"${CMD[@]}"}; then
     break
   fi
@@ -271,5 +367,8 @@ echo "[grok-tui] cwd=$CHAT_CWD"
 # T-260822-044 — 배너도 ★실제로 쓰는 홈을 찍는다. 종전엔 $HOME/.grok 하드코딩이라
 #   계정을 가르면 배너가 1계정을 가리켜 「로그는 여기 있다는데 비어 있다」가 된다.
 echo "[grok-tui] 그록홈=$(grok_home_effective)$([ -n "$(grok_home_override)" ] && printf ' (GRB_GROK_HOME 지정)' || printf ' (기본)')"
-echo "[grok-tui] 세션로그=$(grok_home_effective)/sessions/<urlquote(cwd)>/$SESSION_ID/chat_history.jsonl"
+# ★템플릿이 아니라 ★실제 경로를 찍는다 (T-260824-031). 종전엔 `<urlquote(cwd)>` 리터럴을
+#   그대로 출력해, 정작 「쓰는 쪽과 읽는 쪽이 다른 폴더를 본다」는 이 사고를 디버깅할 때
+#   아무 값도 못 했다. 오늘만 3회 재발한 클래스라(T-260819-028 · -028 · -029) 관측점을 준다.
+echo "[grok-tui] 세션로그=$(grok_session_dir_for "$SESSION_ID")/chat_history.jsonl"
 echo "[grok-tui] 붙기: $TMUX_BIN -L $TMUX_SOCKET attach -t $TMUX_SESSION"

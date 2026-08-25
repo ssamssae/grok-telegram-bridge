@@ -9,6 +9,7 @@ Session continuity: grok's `-s` flag only accepts a UUID, so a chat_id ->
 session uuid mapping is kept in a local state file instead of reusing a
 human-readable key.
 """
+import contextlib
 import http.client
 import importlib.util
 import json
@@ -136,6 +137,17 @@ JOBS = queue.Queue()
 # ★자기재기동은 넣지 않는다(배차 명시). 경보까지가 이 레그다 — 재기동은 증거를 지운다.
 HEALTH_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.health.json")
 INBOX_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.inbox.jsonl")
+# T-260823-051: 재기동 뒤 TUI 최종답 회수. 커서는 「이미 폰으로 보낸 최종답 개수」.
+TUI_CURSOR_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.tui-cursor.json")
+TUI_INFLIGHT_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.tui-inflight.json")
+_JOB_SOURCE = "telegram"
+# 폰발 턴이 도는 동안 로컬 미러는 비켜선다 (T-260824-036). GROK_LOCK 만으로는 못 막는
+# 창이 있다 — process_job 은 락을 놓은 뒤에 mirror_answer 로 커서를 올리고, 그 사이를
+# 미러가 비집으면 같은 답이 폰에 두 번 뜬다.
+_TUI_JOB_ACTIVE = threading.Event()
+# T-260825-003: /clear 가 물린 대기 루프를 접으라는 신호. handle_tui_reset 이 세우고
+#   _tui_wait_for_final 이 본다. 다음 대기가 열릴 때 지운다.
+_TUI_RESET = threading.Event()
 
 
 def _int_env_raw(key, default):
@@ -347,8 +359,19 @@ def mirror_prompt(source, text):
 
 
 def typing_loop(stop_event):
+    """입력중 표시. 예외 1번에 스레드가 죽으면 긴 턴 전체가 무신호가 된다 (T-260822-068)."""
+    failures = 0
     while not stop_event.is_set():
-        tg("sendChatAction", timeout=5, chat_id=CHAT_ID, action="typing")
+        try:
+            result = tg("sendChatAction", timeout=5, chat_id=CHAT_ID, action="typing")
+            # tg() 는 Exception 을 삼키고 None 을 돌려준다. 그 경로도 침묵이면
+            # 실사고처럼 로그에 sendChatAction 흔적 0건이 된다.
+            if result is None:
+                raise RuntimeError("sendChatAction returned None")
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            if failures <= 3:
+                print(f"grb typing 실패({failures}): {exc}", file=sys.stderr)
         if stop_event.wait(TYPING_INTERVAL):
             break
 
@@ -676,7 +699,7 @@ CHAT_LANE = (env("GRB_CHAT_LANE", "headless") or "headless").strip().lower()
 GROK_SESSIONS_DIR = env("GRB_GROK_SESSIONS_DIR", os.path.join(GROK_HOME_EFFECTIVE, "sessions"))
 TUI_SESSION_ID_FILE = os.path.join(STATE_DIR, f"grok-tui-{NAME}.session-id")
 TMUX_BIN = env("GRB_TMUX_BIN", "tmux")
-TMUX_SOCKET = env("GRB_TMUX_SOCKET", "grok")
+TMUX_SOCKET = env("GRB_TMUX_SOCKET", "default")
 TMUX_SESSION = env("GRB_TMUX_SESSION", "grok")
 TMUX_PANE = env("GRB_TMUX_PANE", f"{TMUX_SESSION}:0.0")
 TUI_SUBMIT_KEY = env("GRB_TUI_SUBMIT_KEY", "Enter")
@@ -696,11 +719,62 @@ TUI_SUBMIT_KEY = env("GRB_TUI_SUBMIT_KEY", "Enter")
 #   이 repo 관용구 정렬 = claude 브릿지의 「liveness 가 루프를 몰고 최종 캡이 backstop」
 #     (claude-telegram-bridge.py:391 주석 · CLB_TYPING_MAX_SECONDS 기본 7200). 새 발명이 아니다.
 #   ★ANSWER_TIMEOUT 은 의미가 바뀌었다 = 진전이 계속돼도 끊는 ★최종 캡. 무한 루프 방지용이라
-#     크게 잡는다. 실제로 거의 항상 IDLE 쪽이 먼저 걸린다.
+#     크게 잡는다 (T-260823-048: 1800s 가 실작업을 버렸다. Claude 정렬 7200).
+#     실제로 거의 항상 IDLE 쪽이 먼저 걸린다.
 TUI_IDLE_TIMEOUT = int_env("GRB_TUI_IDLE_TIMEOUT", 180, minimum=1)
-TUI_ANSWER_TIMEOUT = int_env("GRB_TUI_ANSWER_TIMEOUT", 1800, minimum=1)
+TUI_ANSWER_TIMEOUT = int_env("GRB_TUI_ANSWER_TIMEOUT", 7200, minimum=1)
+# T-260823-007: 총 상한/무진전에 잘린 뒤에도 TUI 가 곧 답을 쓰면 그걸 배달한다.
+#   0 이면 종전(잘리는 즉시 에러).
+# T-260825-003: 창의 정본은 유예(60s). max(유예, 총상한) 은 무진전 컷 뒤에도
+#   2시간을 더 쥐어 /clear 가 자물쇠 뒤에서 34분을 기다렸다(제어 노드 00:02~00:36).
+#   총상한으로 잘렸고 진전이 있으면(T-260823-048) 유예 창을 진전마다 다시 연다 —
+#   고정 60s 가 실작업을 버리던 축은 그 조건으로만 살린다.
+#   GRB_TUI_HARVEST_FOLLOW=0 이면 종전 max(유예, 총상한).
+TUI_LATE_HARVEST_GRACE = int_env("GRB_TUI_LATE_HARVEST_GRACE", 60, minimum=0)
+TUI_HARVEST_FOLLOW = int_env("GRB_TUI_HARVEST_FOLLOW", 1, minimum=0)
+# T-260825-003: /clear 가 GROK_LOCK 을 기다리면 물린 잡이 탈출구를 막는다.
+#   1(기본) = 락을 기다리지 않고 레인을 되세운다. 0 이면 종전(락을 기다림).
+TUI_RESET_STEAL = int_env("GRB_TUI_RESET_STEAL", 1, minimum=0)
+# 폰에 「아직 살아있다」를 찍는 간격 (T-260822-068). typing 인디케이터가 안 보여도
+#   이 1줄이 중간보고가 된다. 이야기체 루트에 쌓이면 낡아 보이므로 너무 촘촘히 보내지 않는다.
+TUI_PROGRESS_INTERVAL = int_env("GRB_TUI_PROGRESS_INTERVAL", 60, minimum=1)
+# 1분 간격이어도 26분 턴이면 26통. 상한을 같이 건다 (T-260822-068 폭주 방지).
+#   ★앵커 편집이 켜져 있으면 이 상한은 ★새 말풍선 수에만 걸린다 — 편집은 말풍선을
+#   안 늘리므로 여기서 세지 않는다 (T-260824-042).
+TUI_PROGRESS_MAX = int_env("GRB_TUI_PROGRESS_MAX", 4, minimum=1)
+# ── 진행 앵커 (T-260824-042, 사용자 요청 2026-08-24) ──────────────────────────
+# 종전: 진행 문장을 매번 ★새 말풍선으로 보냈다. 실측 폐해 둘 —
+#   ① 이야기체 루트에 「아직 하고 있어」가 쌓여 대화가 지저분해진다.
+#   ② 3시간 47분 멈춘 턴(T-260824-041 인접 실사고)에서도 문장이 똑같아 dedup 에
+#      걸려 폰엔 아무 변화가 없었다. 「살아있다」와 「멈췄다」가 같은 화면이었다.
+# 지금: 앵커 말풍선 1통을 띄우고 그 통만 editMessageText 로 고쳐 쓴다. 경과시간이
+#   같이 찍히므로 멈춘 턴은 초가 안 흐르는 게 아니라 ★단계가 안 바뀌는 걸로 보인다.
+#   0 이면 종전 동작(새 말풍선 누적) — 되돌리기 스위치다.
+TUI_PROGRESS_ANCHOR = int_env("GRB_TUI_PROGRESS_ANCHOR", 1, minimum=0)
+# 앵커가 생긴 뒤의 갱신 간격. 새 말풍선이 아니라 편집이라 촘촘해도 알림이 안 뜬다
+#   (텔레그램은 editMessageText 에 알림을 안 띄운다). 첫 통까지의 침묵은 여전히
+#   TUI_PROGRESS_INTERVAL 이 쥔다 — 60초는 조용히, 그 뒤부터 살아 움직인다.
+TUI_PROGRESS_EDIT_INTERVAL = int_env("GRB_TUI_PROGRESS_EDIT_INTERVAL", 30, minimum=5)
+# 편집 폭주 방지. 30초 × 240 = 2시간이면 ANSWER_TIMEOUT(7200s) 과 같은 자리다.
+TUI_PROGRESS_EDIT_MAX = int_env("GRB_TUI_PROGRESS_EDIT_MAX", 240, minimum=1)
+TUI_TOOL_PROGRESS_LABELS = {
+    "grep": "코드 찾는 중",
+    "read_file": "파일 읽는 중",
+    "run_terminal_command": "명령 실행 중",
+    "search_replace": "파일 고치는 중",
+    "write": "파일 쓰는 중",
+    "todo_write": "할 일 정리 중",
+    "get_command_or_subagent_output": "돌아가는 작업 기다리는 중",
+    "spawn_subagent": "나눠서 보는 중",
+    "web_search": "웹 찾는 중",
+    "web_fetch": "페이지 읽는 중",
+}
 TUI_LAUNCHER = "grok-tui-session-start.sh"
 TUI_LOG_KEY = "grb_tui_lane"
+# T-260822-074: 그록 TUI 의 /clear=/new 는 새 UUIDv7 대화를 연다. 붙여넣으면
+#   브릿지가 보는 일기장과 갈라져 답이 폰으로 안 돌아간다. 이 두 토큰만 가로챈다.
+TUI_RESET_TOKENS = frozenset({"/clear", "/new"})
+TUI_RESTART_TIMEOUT = int_env("GRB_TUI_RESTART_TIMEOUT", 30, minimum=1)
 
 
 def float_env(k, default):
@@ -714,6 +788,18 @@ def float_env(k, default):
 TUI_POLL_INTERVAL = float_env("GRB_TUI_POLL_INTERVAL", 0.5)
 TUI_SUBMIT_DELAY = float_env("GRB_TUI_SUBMIT_DELAY", 0.3)
 TUI_FALLBACK_HEADLESS = bool_env("GRB_TUI_FALLBACK_HEADLESS", False)
+# ── 로컬 미러: 터미널에 직접 친 턴도 폰에 올린다 (T-260824-036) ─────────────────
+# 종전 TUI 레인이 폰으로 되돌리는 답은 「폰에서 들어온 질문의 답」뿐이었다. 일기장을
+# 읽는 시점이 딱 둘이라(기동 시 harvest 1회 · 폰발 job 직후 1회) 사용자가 tmux 창에
+# 직접 친 턴은 chat_history.jsonl 에만 쌓이고 폰엔 안 떴다 — 원칙 2(모든 활동은 폰에
+# 보인다)의 구멍이고, 실제로 「터미널에서 넣은 질문과 답이 왜 안 오냐」로 관측됐다.
+# ★기본 OFF 다. 옆에서 길게 굴리는 턴까지 전부 밀면 폰이 시끄럽고, 지금 초록인 레인의
+#   기본 동작을 바꾸지 않는 게 정석이다(원칙 8). 켜는 스위치는 env 1개.
+TUI_MIRROR_LOCAL = bool_env("GRB_TUI_MIRROR_LOCAL", False)
+TUI_MIRROR_LOCAL_INTERVAL = float_env("GRB_TUI_MIRROR_LOCAL_INTERVAL", 5.0)
+TUI_MIRROR_LOCAL_SOURCE = "tui-local"
+# 질문 원문을 통째로 밀면 긴 붙여넣기가 폰을 덮는다. 답이 본체고 질문은 꼬리표다.
+TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("GRB_TUI_MIRROR_LOCAL_PROMPT_MAX", 300)
 
 
 def tui_session_id():
@@ -723,6 +809,183 @@ def tui_session_id():
     그래서 기동면이 `--session-id` 로 못 박고 그 값을 여기서 되읽는다.
     """
     return (env("GRB_TUI_SESSION_ID") or _read(TUI_SESSION_ID_FILE)).strip()
+
+
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 「보는 일기장이 맞나」를 묻는 층 (T-260824-028).
+#
+# 발원 실사고 2026-08-24 13:42 사용자 신고. 터미널엔 27초 만에 답이 완성됐는데 폰엔
+# 「180s 무진전」 실패가 떴다. 제어 노드 프로브 실측:
+#   핀(state/grok-tui-<name>.session-id) = 79dfae94… / 그 chat_history 마지막 = 01:02
+#   살아있는 대화 = 01a02f5d-a3af-★7ca1(UUIDv7 = 그록이 새로 연 대화) / 13:41 까지 기록
+# 즉 그록 TUI 가 도중 새 대화로 갈아탔는데 브릿지는 기동 때 적은 파일을 계속 읽었다.
+# ★답이 없던 게 아니라 다른 일기장을 본 것이다. 그록 프로세스 argv 는 여전히
+# `--session-id 79dfae94` 라 argv 로도 추적이 안 된다(실측).
+#
+# ★작업 노드 구조 신호(escalation T-260824-027): 이 표면 수리 4건
+#   (T-260823-007/-048/-051, T-260824-001)이 전부 ★회수 창을 넓히는 층이고
+#   「보는 파일이 맞나」를 묻는 층은 0건이었다. 그래서 계속 안 고쳐졌다.
+#
+# ★함부로 따라가지 않는다 — T-260822-074 의 판단을 뒤집지 않는다.
+#   그 티켓은 "새 폴더를 멋대로 따라가면 잘못된 대화를 집을 수 있다" 며 추종을 거부했고
+#   그 우려는 여전히 옳다(같은 cwd 에 `gg local` 등 평행 세션이 생길 수 있다).
+#   그래서 ★증거가 모호하지 않을 때만 따라간다. 조건 넷을 모두 만족해야 한다:
+#     ① 핀한 대화가 죽어 있다 (FOLLOW_STALE_SEC 동안 무기록) — 살아있는 대화는 안 뺏는다
+#     ② 핀보다 ★엄격히 최신인 후보가 있다
+#     ③ 그런 후보가 ★정확히 하나다 (둘 이상이면 모호 → 안 따라간다)
+#     ④ 그 후보가 최근에 쓰였다 (FOLLOW_FRESH_SEC 이내)
+#   하나라도 어긋나면 추종하지 않고 ★진단만 돌려준다. 그 진단은 타임아웃 문구에 실려
+#   나간다 — 이 사고의 진짜 피해는 잘린 것이 아니라 ★조용히 잘린 것이었다.
+TUI_FOLLOW_STALE_SEC = int_env("GRB_TUI_FOLLOW_STALE_SEC", 90, minimum=1)
+TUI_FOLLOW_FRESH_SEC = int_env("GRB_TUI_FOLLOW_FRESH_SEC", 3600, minimum=1)
+# ★실패 ★순간의 추종·회수 (T-260825-003).
+#   위 조건 ④(후보가 FRESH_SEC 이내)는 ★발사 직전 판정에서 함정이 된다 — 레인이 한 시간만
+#   쉬면 살아있는 대화도 창 밖으로 밀려 후보 0개가 되고, 브릿지는 죽은 일기장을 계속 본다.
+#   그런데 그록이 답을 쓰는 순간 그 대화는 fresh 가 되고, 실패 직전의 tui_rotation_diagnosis()
+#   는 그제서야 rotated 를 말한다. ⇒ ★판정이 이르고 진단은 늦다. 그 사이에서 답이 통째로
+#   버려진다. 이 스위치가 그 틈을 닫는다: 진단이 rotated 를 말하는 자리에서 핀을 옮기고,
+#   살아있는 일기장에서 ★이 질문의 답을 건져 배달한다.
+TUI_RESCUE_ON_ROTATION = bool_env("GRB_TUI_RESCUE_ON_ROTATION", True)
+# 질문 대조에 쓰는 앞머리 길이. 짧으면 남의 답을 내 답으로 오인하고, 너무 길면 TUI 가
+# 줄바꿈·말줄임으로 다듬은 질문과 안 맞는다.
+TUI_RESCUE_MATCH_CHARS = int_env("GRB_TUI_RESCUE_MATCH_CHARS", 24, minimum=4)
+
+
+def _tui_sessions_root():
+    return os.path.join(
+        os.path.expanduser(GROK_SESSIONS_DIR),
+        urllib.parse.quote(ensure_chat_cwd(), safe=""),
+    )
+
+
+def _history_stat(session_uuid):
+    """일기장 상태. 0.0 하나로 없음·못 읽음·아직 안 씀을 뭉개지 않는다 (T-260824-041).
+
+    반환 = (kind, mtime)
+      ok          파일이 있고 내용이 있다 (mtime > 0)
+      empty       세션 폴더는 있는데 일기장이 없거나 0바이트 — 방금 켬
+      missing     세션 폴더 자체가 없다 — 핀이 가리키는 대화가 사라짐
+      unreadable  권한 등 OSError — 없다고 단정하지 않는다 (T-260824-039 동형)
+    """
+    if not session_uuid:
+        return ("missing", 0.0)
+    root = _tui_sessions_root()
+    session_dir = os.path.join(root, session_uuid)
+    path = os.path.join(session_dir, "chat_history.jsonl")
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        try:
+            if os.path.isdir(session_dir):
+                return ("empty", 0.0)
+        except OSError:
+            return ("unreadable", 0.0)
+        return ("missing", 0.0)
+    except OSError:
+        return ("unreadable", 0.0)
+    if st.st_size == 0:
+        return ("empty", float(st.st_mtime))
+    return ("ok", float(st.st_mtime))
+
+
+def tui_session_rotation():
+    """핀한 세션과 실제로 살아 있는 세션이 갈렸는지 본다.
+
+    반환 = dict(pin, pin_mtime, live, live_mtime, verdict, why)
+      verdict: "ok"        핀이 살아 있다 (또는 판정 불가)
+               "rotated"   갈렸고 추종 조건 4개를 모두 만족한다
+               "ambiguous" 갈린 것 같은데 후보가 여럿이라 안 따라간다
+    """
+    pin = tui_session_id()
+    root = _tui_sessions_root()
+    now = time.time()
+    kind, pin_mtime = _history_stat(pin) if pin else ("missing", 0.0)
+    out = {"pin": pin, "pin_mtime": pin_mtime, "pin_kind": kind,
+           "live": "", "live_mtime": 0.0, "verdict": "ok", "why": ""}
+
+    if not pin:
+        out["why"] = "핀이 비어 있다"
+        return out
+    # 못 읽으면 「없다」고 단정하지 않는다 — 추종을 열지 않는다.
+    if kind == "unreadable":
+        out["why"] = "핀한 대화의 일기장을 못 읽었다 — 없다고 단정하지 않는다"
+        return out
+    # 방금 켠 세션(폴더만 있고 첫 줄 전)을 죽었다고 보고 뺏지 않는다.
+    # ★0.0 을 살아있다고 뒤집지 않는다. missing 은 아래 후보 검색으로 내려간다.
+    if kind == "empty":
+        out["why"] = "핀한 대화가 아직 기록 중이다"
+        return out
+    # ① 핀이 아직 살아 있으면 건드리지 않는다.
+    #    pin_mtime 이 0 인 ok 는 없다. 0 을 truthy 로 뒤집으면 missing 추종이 영영 안 돈다.
+    if kind == "ok" and pin_mtime and (now - pin_mtime) < TUI_FOLLOW_STALE_SEC:
+        out["why"] = "핀한 대화가 아직 기록 중이다"
+        return out
+
+    try:
+        names = os.listdir(root)
+    except OSError as exc:
+        out["why"] = f"세션 폴더를 못 읽었다({exc})"
+        return out
+
+    cands = []
+    for name in names:
+        if name == pin:
+            continue
+        cand_kind, m = _history_stat(name)
+        if cand_kind != "ok":
+            continue
+        if m <= pin_mtime:                      # ② 핀보다 엄격히 최신만
+            continue
+        if (now - m) > TUI_FOLLOW_FRESH_SEC:    # ④ 최근에 쓰인 것만
+            continue
+        cands.append((m, name))
+
+    if not cands:
+        out["why"] = "핀보다 최신인 살아있는 후보가 없다"
+        return out
+    cands.sort(reverse=True)
+    out["live"], out["live_mtime"] = cands[0][1], cands[0][0]
+    if len(cands) > 1:                          # ③ 하나일 때만
+        out["verdict"] = "ambiguous"
+        out["why"] = f"후보가 {len(cands)}개다 — 잘못된 대화를 집을 수 있어 안 따라간다"
+        return out
+    out["verdict"] = "rotated"
+    out["why"] = "핀한 대화는 죽었고 살아있는 후보가 정확히 하나다"
+    return out
+
+
+def tui_rotation_diagnosis(rot=None):
+    """사람이 읽는 한 줄 진단. 조용한 타임아웃을 막는 것이 목적이다."""
+    rot = rot or tui_session_rotation()
+    if rot["verdict"] == "ok":
+        return ""
+    def _ts(v):
+        return time.strftime("%H:%M:%S", time.localtime(v)) if v else "없음"
+    return (
+        f"★브릿지가 보는 대화가 갈렸다({rot['verdict']}) — "
+        f"핀={rot['pin'][:8]}… 마지막기록={_ts(rot['pin_mtime'])} / "
+        f"살아있는쪽={rot['live'][:8] or '?'}… 마지막기록={_ts(rot['live_mtime'])}. "
+        f"{rot['why']}"
+    )
+
+
+def tui_follow_session_rotation():
+    """조건을 만족할 때만 핀을 살아있는 세션으로 옮긴다. 옮겼으면 새 uuid 를 반환."""
+    rot = tui_session_rotation()
+    if rot["verdict"] != "rotated":
+        return ""
+    try:
+        # 되돌릴 수 있게 옛 핀을 남긴다 (원칙 7). _write 는 tmp+os.replace —
+        # open(..., "w") 는 열자마자 잘라 실패 시 핀이 빈 문자열이 된다 (T-260824-041).
+        _write(TUI_SESSION_ID_FILE + ".prev", rot["pin"])
+        _write(TUI_SESSION_ID_FILE, rot["live"])
+    except OSError as exc:
+        print(f"{TUI_LOG_KEY} 세션 추종 실패: {exc}", file=sys.stderr)
+        return ""
+    print(
+        f"{TUI_LOG_KEY} 세션 추종 {rot['pin']} → {rot['live']} ({rot['why']})",
+        file=sys.stderr,
+    )
+    return rot["live"]
 
 
 def tui_history_path():
@@ -766,6 +1029,83 @@ def tui_dead_message():
     )
 
 
+def slash_token(text):
+    """텔레그램 한 줄 슬래시 명령 토큰. clb slash_token 과 같은 계약.
+
+    `/clear`, `/clear@bot`, ` /NEW  ` → `/clear`/`/new`.
+    개행이 있거나 맨 앞이 / 가 아니면 평문("").
+    """
+    stripped = (text or "").strip()
+    if "\n" in stripped or not stripped.startswith("/"):
+        return ""
+    return stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
+
+
+def tui_launcher_bin():
+    """기동면 실경로. 공개판은 브릿지와 같은 폴더, 내부 repo 는 scripts/ 옆.
+
+    GRB_TUI_LAUNCHER 는 테스트 스텁·운영자 오버라이드. 건강감시 스크립트와 같은 이름.
+    """
+    return env("GRB_TUI_LAUNCHER") or os.path.join(SCRIPT_DIR, "grok-tui-session-start.sh")
+
+
+def restart_tui_session():
+    """기동면 --force 로 상주 TUI 를 새로 세운다. 새 uuid 가 상태파일에 박힌다.
+
+    /clear 를 창에 붙여넣지 않는 이유 = 그록 TUI 의 /clear=/new 는 새 UUIDv7
+    대화를 열고, 브릿지는 기동 때 박은 session-id 파일만 본다(T-260822-074).
+    새 폴더를 멋대로 따라가면 잘못된 대화를 집을 수 있어 쓰지 않는다.
+    """
+    launcher = tui_launcher_bin()
+    if not os.path.isfile(launcher):
+        raise GrokExecError(f"TUI 기동면이 없다({launcher})")
+    try:
+        proc = subprocess.run(
+            [launcher, "--force"],
+            capture_output=True,
+            text=True,
+            timeout=TUI_RESTART_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GrokExecError(f"TUI 재기동 시간 초과: {exc}") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()[:400]
+        raise GrokExecError(
+            f"TUI 재기동 실패 rc={proc.returncode}: {err or 'stderr 비어 있음'}"
+        )
+    sid = tui_session_id()
+    if not sid:
+        raise GrokExecError(f"TUI 재기동 후 uuid 가 없다({TUI_SESSION_ID_FILE})")
+    print(f"{TUI_LOG_KEY} /clear 재기동 uuid={sid}", file=sys.stderr)
+    return sid
+
+
+def handle_tui_reset(source="telegram", task_id=None):
+    """TUI 레인 /clear|/new — 붙여넣지 않고 창을 다시 세운다.
+
+    T-260825-003: ingest 는 줄을 건너뛰지만 이 함수가 GROK_LOCK 을 기다리면
+      물린 잡이 탈출구를 막는다. 기본은 락을 기다리지 않는다. 물린 대기 루프는
+      _TUI_RESET 을 보고 접힌다. 건질 답이 0인 경우가 이 경로의 전제다
+      (오늘 실측: 핀한 대화가 죽어 있었다). GRB_TUI_RESET_STEAL=0 이면 종전.
+    """
+    _TUI_RESET.set()
+    try:
+        if TUI_RESET_STEAL:
+            restart_tui_session()
+        else:
+            with GROK_LOCK:
+                restart_tui_session()
+    except GrokExecError as exc:
+        mirror_error(source, str(exc), task_id=task_id)
+        return
+    msg = "대화를 새로 열었어. 이어서 말하면 돼."
+    local_print(msg)
+    # kind=final. ack 는 R-C5 가 본문을 버리고 노드 이모지 1자만 보낸다
+    # (실사고: 폰 /clear 확인이 부엉이만 큼직하게 찍힘, T-260823-025).
+    deliver_mesh_event("final", msg, task_id=task_id)
+
+
 def _read_history_rows(path):
     """chat_history.jsonl 을 관대하게 읽는다. 쓰는 중 잘린 마지막 줄은 버린다."""
     rows = []
@@ -803,6 +1143,44 @@ def _tui_final_answer_rows(rows):
     return finals
 
 
+# ★사람이 친 발화만 고른다 (T-260824-036). 실측(그록 1.0.4 세션 로그): 사람 줄은
+#   type=user 이고 content 블록 안에 <user_query>…</user_query> 로 감싸여 온다.
+#   하네스가 끼워 넣는 줄은 synthetic_reason 이 붙거나 그 태그가 아예 없다 — 안 가리면
+#   system-reminder 뭉치가 질문인 척 폰에 뜬다.
+_USER_QUERY_OPEN = "<user_query>"
+_USER_QUERY_CLOSE = "</user_query>"
+
+
+def _tui_user_query_text(row):
+    if not isinstance(row, dict) or row.get("type") != "user":
+        return ""
+    if row.get("synthetic_reason"):
+        return ""
+    content = row.get("content")
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        text = block.get("text") if isinstance(block, dict) else block
+        if not isinstance(text, str):
+            continue
+        start = text.find(_USER_QUERY_OPEN)
+        if start < 0:
+            continue
+        end = text.find(_USER_QUERY_CLOSE, start)
+        body = text[start + len(_USER_QUERY_OPEN) : end if end >= 0 else None]
+        if body.strip():
+            return body.strip()
+    return ""
+
+
+def _tui_final_answer_indices(rows):
+    """최종답이 몇 번째 행인지. 질문 짝을 뒤로 찾으려면 위치가 필요하다.
+
+    판정 규칙은 재현하지 않고 _tui_final_answer_rows 에 그대로 묻는다 — 같은 규칙을
+    두 곳에 두면 한쪽만 고쳐져 생각 중인 문장이 답으로 새는 길이 생긴다.
+    """
+    return [idx for idx, row in enumerate(rows) if _tui_final_answer_rows([row])]
+
+
 def _tui_tool_call_names(rows):
     names = []
     for row in rows:
@@ -812,6 +1190,56 @@ def _tui_tool_call_names(rows):
             if isinstance(call, dict):
                 names.append(str(call.get("name") or "?"))
     return names
+
+
+def _tui_elapsed_words(seconds):
+    """경과시간을 사람 말로. 「3분 47초」 — 사용자 DM 은 숫자표(04:07)가 아니라 산문이다."""
+    total = int(max(0, seconds))
+    if total < 60:
+        return f"{total}초"
+    if total < 3600:
+        return f"{total // 60}분 {total % 60}초"
+    return f"{total // 3600}시간 {(total % 3600) // 60}분"
+
+
+def _tui_progress_line(reported, elapsed=None):
+    """사용자 DM 용 한 줄. 선두 이모지 없음 (이야기체).
+
+    ★elapsed 를 붙이는 이유(T-260824-042) = 「아직 하고 있어」만 반복하면 살아있는 턴과
+      멈춘 턴이 폰에서 같은 화면이다. 실사고: 3시간 47분 물려 있던 턴이 같은 문장이라
+      dedup 에 걸려 폰엔 변화가 0이었다. 경과시간이 있으면 「단계는 그대론데 시간만
+      흐른다」가 눈에 보인다.
+    """
+    if not reported:
+        head = "아직 하고 있어"
+        tail = ". 답은 끝나면 바로 보낼게."
+    else:
+        last = reported[-1]
+        head = f"아직 하고 있어. 지금은 {TUI_TOOL_PROGRESS_LABELS.get(last, last)}"
+        tail = "."
+    if elapsed is None:
+        return f"{head}{tail}"
+    return f"{head} · {_tui_elapsed_words(elapsed)} 경과"
+
+
+def _tui_progress_done_line(elapsed, ok=True, reset=False):
+    """앵커 마감 한 줄. 답 본문은 기존 mirror_answer 가 따로 배달한다.
+
+    앵커를 그냥 두면 답이 온 뒤에도 「아직 하고 있어」가 위에 남는다 — 끝난 걸 끝났다고
+    적어야 화면이 거짓말을 안 한다(원칙 6). 도구 목록은 안 싣는다: 바로 아래에 답이
+    붙으므로 여기서 되풀이하면 같은 말을 두 번 하는 화면이 된다.
+
+    ★실패 턴을 「다 했어」로 닫지 않는다 — 에러 메시지는 따로 가는데 앵커만 초록이면
+      화면 두 줄이 서로 다른 말을 한다. 사유는 안 싣는다(에러 통이 이미 싣는다).
+    ★/clear 로 접힌 턴은 에러 통이 안 따라온다 (process_job 이 mirror_error 없이
+      return). 「사유는 아래」는 그때 거짓이다. handle_tui_reset ack 와 겹치지 않게
+      이 말풍선만 「이 턴은 접었다」고 마감한다 (T-260825-003 회신).
+    """
+    if reset:
+        return f"이 턴은 접었어 · {_tui_elapsed_words(elapsed)} 만에"
+    if not ok:
+        return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에 (사유는 아래)"
+    return f"다 했어 · {_tui_elapsed_words(elapsed)} 걸림"
 
 
 def _tui_tool_in_flight(rows):
@@ -844,22 +1272,576 @@ def _tui_tool_in_flight(rows):
     return bool(pending) or anonymous_open > 0
 
 
+def _tui_json_load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _tui_json_save(path, data):
+    """디스크 실패가 워커를 죽이면 회수 레일 자체가 침묵 실패가 된다. fail-open."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} state write 실패 {path}: {exc}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _tui_cursor_load():
+    return _tui_json_load(TUI_CURSOR_FILE)
+
+
+def _tui_cursor_save(session_id, finals_sent):
+    _tui_json_save(
+        TUI_CURSOR_FILE,
+        {"session_id": session_id, "finals_sent": int(finals_sent), "ts": time.time()},
+    )
+
+
+# ── 히스토리 압축 대응 (T-260825-005) ─────────────────────────────────────────
+# 그록 TUI 는 대화가 길어지면 chat_history.jsonl 을 ★스스로 줄인다. 그 순간 브릿지가
+# 들고 있던 "몇 번째부터 읽어라"(baseline 인덱스)와 "몇 개까지 보냈다"(커서 카운터)가
+# 통째로 무효가 된다 — 둘 다 줄어들 수 없는 파일을 전제로 만든 값이기 때문이다.
+#
+# ★실사고 2026-08-24 22:19~00:47 (작업 노드, 2시간 28분):
+#   640행에서 baseline=634 를 적고 붙여넣었는데 그록이 22:24 에 52행으로 압축했다.
+#   rows[634:] 는 그때부터 영구 빈 슬라이스다. 답은 22:24:08 에 파일 맨 뒤에 멀쩡히
+#   적혀 있었는데 브릿지는 없는 페이지만 넘기며 굶었다. 무진전 타임아웃도 못 잡았다 —
+#   이미 도구를 쓴 턴이라 그 가지는 break 대신 타이머를 재무장하기 때문이다(위 참조).
+#   그래서 총상한 7200s 를 다 채우고 늦은회수 7200s 로 넘어갔다. 그 사이 다음 지시가
+#   큐에 쌓였다가 재기동 때 유실됐다.
+#
+# ★이 사고의 본체는 "잘못 읽은 것" 이 아니라 ★"조용히 빈 슬라이스를 돌려준 것" 이다.
+#   그래서 두 헬퍼 다 값을 되돌리기만 하지 않고 반드시 크게 찍는다(원칙 6 fail-loud).
+def _tui_rebaseline_if_compacted(path, baseline):
+    """행수가 baseline 보다 적으면 압축이다 — 0 으로 되돌리고 rows 와 함께 돌려준다."""
+    rows = _read_history_rows(path)
+    if len(rows) < baseline:
+        print(
+            f"{TUI_LOG_KEY} ★히스토리 압축 감지 — baseline={baseline} > 현재 {len(rows)}행. "
+            f"0 으로 재기준화한다 (T-260825-005)",
+            file=sys.stderr,
+        )
+        baseline = 0
+    return rows, baseline
+
+
+def _tui_cursor_clamp(already, total):
+    """커서가 현재 최종답 개수를 앞서면 압축 전 파일의 값이다 — 0 부터 다시 회수한다.
+
+    압축된 파일은 짧아서 0 부터 훑어도 폭주하지 않는다. 반대로 그냥 두면 갇힌 답이
+    영원히 안 나간다 — 실사고에서 커서 13 vs 실제 최종답 1본이 정확히 그 상태였다.
+    """
+    if already > total:
+        print(
+            f"{TUI_LOG_KEY} ★커서가 파일보다 앞선다 — finals_sent={already} > 현재 {total}본. "
+            f"압축으로 보고 0 부터 회수한다 (T-260825-005)",
+            file=sys.stderr,
+        )
+        return 0
+    return max(already, 0)
+
+
+def _tui_inflight_load():
+    return _tui_json_load(TUI_INFLIGHT_FILE)
+
+
+def _tui_inflight_write(payload):
+    rec = dict(payload or {})
+    rec["ts"] = time.time()
+    _tui_json_save(TUI_INFLIGHT_FILE, rec)
+
+
+def _tui_inflight_clear():
+    try:
+        os.unlink(TUI_INFLIGHT_FILE)
+    except OSError:
+        pass
+
+
+def harvest_orphaned_tui_finals(source="telegram", task_id=None):
+    """재기동 뒤 jsonl 에 남은 미발신 최종답을 폰으로 보낸다 (T-260823-051).
+
+    커서 부재의 첫 기동은 현재 개수로만 초기화한다 — 과거 일기장 폭주를 막는다.
+    다만 inflight 가 같은 세션이면 baseline 이후만 회수한다(죽은 턴의 답).
+    """
+    if CHAT_LANE != "tui":
+        return 0
+    sid = (tui_session_id() or "").strip()
+    if not sid:
+        return 0
+    rows = _read_history_rows(tui_history_path())
+    finals = _tui_final_answer_rows(rows)
+    cur = _tui_cursor_load()
+    already = None
+    if cur.get("session_id") == sid:
+        try:
+            already = int(cur.get("finals_sent") or 0)
+        except (TypeError, ValueError):
+            already = 0
+    if already is None:
+        job = _tui_inflight_load()
+        if job.get("session_id") == sid:
+            try:
+                baseline = int(job.get("baseline") or 0)
+            except (TypeError, ValueError):
+                baseline = 0
+            already = len(_tui_final_answer_rows(rows[: max(baseline, 0)]))
+            source = job.get("source") or source
+        else:
+            _tui_cursor_save(sid, len(finals))
+            return 0
+    new_rows = finals[_tui_cursor_clamp(already, len(finals)) :]
+    sent = 0
+    for row in new_rows:
+        text = str(row.get("content") or "").strip()
+        if not text:
+            continue
+        print(f"{TUI_LOG_KEY} orphaned final harvest", file=sys.stderr)
+        mirror_answer(source, text, task_id=task_id)
+        sent += 1
+    _tui_cursor_save(sid, len(finals))
+    return sent
+
+
+def _tui_wait_inflight_if_any():
+    """기동 직후: 죽기 전 붙여넣은 턴의 답이 아직 안 왔으면 기다린다. 붙여넣기는 안 한다."""
+    job = _tui_inflight_load()
+    if not job:
+        return
+    sid = (tui_session_id() or "").strip()
+    if not sid or job.get("session_id") != sid:
+        return
+    if not tui_session_alive():
+        return
+    try:
+        baseline = int(job.get("baseline") or 0)
+    except (TypeError, ValueError):
+        return
+    try:
+        _tui_wait_for_final(tui_history_path(), baseline)
+    except GrokExecError as exc:
+        print(f"{TUI_LOG_KEY} inflight wait: {exc}", file=sys.stderr)
+
+
+def _darwin_clipboard_info_has_image(info):
+    """osascript 'clipboard info' 출력에 사진 flavor 가 있는지 (T-260824-006).
+
+    실측 2026-08-24 제어 노드: 스크린샷이 남은 pasteboard 는
+    `«class PNGf», 3511527, «class AVIF», … TIFF picture …` 이고 문자열 flavor 가 없다.
+    글만 남은 pasteboard 는 `«class utf8», 0, string, 0`.
+    """
+    blob = (info or "").lower()
+    if not blob.strip():
+        return False
+    needles = (
+        "pngf",
+        "tiff",
+        "jpeg picture",
+        "gif picture",
+        "jp2",
+        "class 8bps",
+        "class bmp",
+        "class avif",
+    )
+    return any(token in blob for token in needles)
+
+
+def _darwin_clipboard_info():
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", "clipboard info"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{TUI_LOG_KEY} clipboard info: {exc}", file=sys.stderr)
+        return ""
+    return result.stdout or ""
+
+
+def _darwin_park_clipboard_png():
+    """사진 flavor 가 있으면 PNG 로 백업하고 pasteboard 를 글만 남긴다. 없으면 None."""
+    if not _darwin_clipboard_info_has_image(_darwin_clipboard_info()):
+        return None
+    handle = tempfile.NamedTemporaryFile(prefix="grb-clip-", suffix=".png", delete=False)
+    handle.close()
+    path = handle.name
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        "try\n"
+        "  set pngData to the clipboard as «class PNGf»\n"
+        f'  set outFile to open for access POSIX file "{escaped}" with write permission\n'
+        "  set eof outFile to 0\n"
+        "  write pngData to outFile\n"
+        "  close access outFile\n"
+        '  return "ok"\n'
+        "on error\n"
+        '  return "no"\n'
+        "end try"
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{TUI_LOG_KEY} clipboard park: {exc}", file=sys.stderr)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    if (result.stdout or "").strip() != "ok" or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    try:
+        subprocess.run(["pbcopy"], input=b"", capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{TUI_LOG_KEY} clipboard clear: {exc}", file=sys.stderr)
+    print(f"{TUI_LOG_KEY} clipboard image parked {path}", file=sys.stderr)
+    return path
+
+
+def _darwin_restore_clipboard_png(path):
+    if not path or not os.path.isfile(path):
+        return
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'set pngData to (read POSIX file "{escaped}" as «class PNGf»)\n'
+        "set the clipboard to pngData"
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{TUI_LOG_KEY} clipboard restore: {exc} (parked at {path})", file=sys.stderr)
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _isolate_os_clipboard_images():
+    """주입 동안 macOS pasteboard 사진을 가린다 (T-260824-006).
+
+    그록 TUI 는 paste/submit 때 NSPasteboard 의 스크린샷도 [Image #1] 칩으로 붙인다
+    (docs/user-guide/03-keyboard-shortcuts.md Image Paste = Cmd+V 가 사진을 칩으로).
+    텔레그램 inbox 는 글만인데 TUI 제출이 같은 화면을 반복 첨부하던 축:
+    제어 노드 2026-08-24 00:00·00:33 「안녕하세요」 2회, update 687750885/886 text-only,
+    세션 asset md5 동일, pasteboard PNG 3456x2234 3,511,527B = 재인코딩 전 원본.
+
+    T-260823-030/034/046 의 Space+C-c 는 입력칸 칩만 지운다. paste 가 pasteboard 를
+    다시 읽으면 칩이 되살아나서 세 번 고치고도 남았다. 주입 구간(초점·클리어·paste·
+    Enter) 동안 사진 flavor 만 비웠다가 되돌린다. darwin 이외는 no-op.
+    """
+    parked = None
+    if sys.platform == "darwin":
+        try:
+            parked = _darwin_park_clipboard_png()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{TUI_LOG_KEY} clipboard park failed: {exc}", file=sys.stderr)
+            parked = None
+    try:
+        yield
+    finally:
+        if parked:
+            try:
+                _darwin_restore_clipboard_png(parked)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{TUI_LOG_KEY} clipboard restore failed: {exc}", file=sys.stderr)
+
+
+def _tui_clear_composer():
+    """직전 턴의 사진 칩이 입력칸에 남는 것을 걷는다 (T-260823-046).
+
+    그록 TUI 는 사진 경로를 [Image #1] 칩으로 붙이고 제출 후에도 칩이 남는다.
+    글만 paste 하면 그 칩이 같이 제출된다 (제어 노드 실측: 「안녕하세요 [Image #1]」).
+
+    단축키 SoT (docs/user-guide/03-keyboard-shortcuts.md):
+      idle + 비어있지 않은 초안(글 또는 image chips) + **prompt focused**
+      → Ctrl+C 1회로 비움.
+    초점이 스크롤백에 있으면 C-c 는 칩을 안 지운다 (제어 노드 22:45 「ㅎㅇ」 실측:
+    텔레그램은 글만, 제출 버블은 「ㅎㅇ[Image #1]」). Space 는 스크롤백에서
+    입력칸으로 초점을 옮긴다. 이미 입력이면 공백 1자가 들어가고 바로 뒤 C-c 가
+    그 공백과 칩을 같이 지운다.
+    2× Esc 는 빈 칸에서 rewind 를 열므로 쓰지 않는다.
+
+    C-c 만으로는 모자란다. macOS pasteboard 에 스크린샷이 남아 있으면 paste 가
+    칩을 다시 붙인다 — `_isolate_os_clipboard_images` (T-260824-006) 가 그 축이다.
+    """
+    _tmux("send-keys", "-t", TMUX_PANE, "Space")
+    time.sleep(TUI_SUBMIT_DELAY)
+    _tmux("send-keys", "-t", TMUX_PANE, "C-c")
+    time.sleep(TUI_SUBMIT_DELAY)
+
+
 def _tui_paste(prompt):
     """crb 와 같은 tmux 3단(load-buffer → paste-buffer → 제출키).
 
     send-keys 로 본문을 직접 타이핑하지 않는 이유는 crb 와 같다 — 여러 줄·특수문자가
     조합키로 해석되는 경로를 아예 안 만든다.
+
+    사진 칩 축은 두 겹이다. 입력칸 잔칩 = Space 뒤 C-c (T-260823-046).
+    pasteboard 재주입 = `_isolate_os_clipboard_images` 가 제출키까지 감싼다
+    (T-260824-006). 둘 중 하나만 있으면 「안녕하세요 [Image #1]」 가 되살아난다.
     """
     payload = (prompt or "").rstrip("\n")
     if not payload:
         return
-    _tmux("load-buffer", "-", input_text=payload)
-    _tmux("paste-buffer", "-p", "-t", TMUX_PANE)
-    time.sleep(TUI_SUBMIT_DELAY)
-    _tmux("send-keys", "-t", TMUX_PANE, TUI_SUBMIT_KEY)
+    # ★붙여넣기 직전에 「보는 일기장이 맞나」를 확인한다 (T-260824-028).
+    #   그록 TUI 가 도중 새 대화로 갈아탔으면 여기서 따라간다 — 조건 4개를 모두
+    #   만족할 때만이고, 모호하면 안 따라가고 진단만 남긴다(tui_session_rotation).
+    #   발사 ★직전에 두는 이유 = 대기 루프가 열기 전에 맞춰야 그 턴이 회수된다.
+    try:
+        tui_follow_session_rotation()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 세션 추종 점검 실패: {exc}", file=sys.stderr)
+    with _isolate_os_clipboard_images():
+        _tui_clear_composer()
+        _tmux("load-buffer", "-", input_text=payload)
+        _tmux("paste-buffer", "-p", "-t", TMUX_PANE)
+        time.sleep(TUI_SUBMIT_DELAY)
+        _tmux("send-keys", "-t", TMUX_PANE, TUI_SUBMIT_KEY)
 
 
-def run_grok_tui(prompt):
+def _tui_rescue_after_rotation(prompt, started_at):
+    """실패 직전 1회 — 갈린 대화에서 ★이 질문의 답을 건진다 (T-260825-003).
+
+    반환 = (답 문자열 or "", 핀을 옮겼는가).
+
+    ⚠️ 제거 금지 (DO NOT REMOVE) — 발사 직전 추종(_tui_paste)만으로는 이 사고를 못 막는다.
+      실사고 2026-08-24 22:17 KST (macOS 노드): 그록 TUI 는 멀쩡히 일해서 22:17 에 조직도 작업을
+      끝내고 답까지 썼는데(PR 머지·배포 완료), 브릿지는 하루 전 죽은 일기장
+      (핀=05d0ee83…, 마지막기록 8/23 23:17)을 보며 기다렸고 사용자 폰에는 ★2시간 동안
+      한 글자도 안 갔다. 00:20 실패 통지에는 「rotated … 살아있는쪽=01a02f49…
+      마지막기록 00:18:53」 이 ★정확히 찍혔는데도 핀은 그대로였다 — 아는데 안 옮겼다.
+      그래서 다음 질문도 같은 죽은 파일을 보고 또 침묵했을 것이다(수동 개입으로 끊었다).
+
+    ★남의 답을 배달하지 않는다 = 두 겹으로 확인한 뒤에만 건진다.
+      ① 살아있는 일기장이 ★이 잡이 시작된 뒤에 쓰였다 (그 전 기록이면 남의 턴이다)
+      ② 그 최종답 ★바로 앞의 질문이 내가 보낸 질문이다 (앞머리 대조)
+      하나라도 어긋나면 건지지 않고 종전대로 실패를 올린다. ★핀 이동은 그래도 남는다 —
+      다음 턴이 살아있는 대화를 보게 하는 것이 회수 실패보다 중요하다.
+    """
+    if not TUI_RESCUE_ON_ROTATION:
+        return "", False
+    head = (prompt or "").strip()
+    needle = head.splitlines()[0].strip()[:TUI_RESCUE_MATCH_CHARS] if head else ""
+    rot = tui_session_rotation()
+    if rot["verdict"] != "rotated":
+        return "", False
+    # ★잡보다 먼저 쓰인 일기장은 이 턴의 증거가 아니다.
+    if not rot["live_mtime"] or rot["live_mtime"] < started_at:
+        print(
+            f"{TUI_LOG_KEY} 갈림 회수 안 함 — 살아있는쪽이 이 잡 시작 뒤에 안 쓰였다",
+            file=sys.stderr,
+        )
+        return "", False
+    if not tui_follow_session_rotation():
+        return "", False
+    if len(needle) < 4:
+        return "", True
+    try:
+        rows = _read_history_rows(tui_history_path())
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 갈림 회수 — 새 일기장을 못 읽었다: {exc}", file=sys.stderr)
+        return "", True
+    finals = _tui_final_answer_indices(rows)
+    if not finals:
+        return "", True
+    pos = finals[-1]
+    for back in range(pos - 1, -1, -1):
+        question = _tui_user_query_text(rows[back])
+        if not question:
+            continue
+        # ★가장 가까운 질문 ★하나만 본다. 더 뒤로 가면 옛 질문에 새 답을 붙인다.
+        if needle in question or question.strip()[: len(needle)] == needle:
+            print(f"{TUI_LOG_KEY} 갈린 대화에서 답 회수 (핀 이동 후)", file=sys.stderr)
+            return str(rows[pos].get("content") or "").strip(), True
+        print(
+            f"{TUI_LOG_KEY} 갈림 회수 안 함 — 마지막 답 앞의 질문이 내 질문이 아니다",
+            file=sys.stderr,
+        )
+        return "", True
+    return "", True
+
+
+def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
+    """baseline 이후 최종답 1개를 기다린다. 없으면 GrokExecError.
+
+    run_grok_tui 와 재기동 회수가 같은 대기 루프를 쓴다 — 잘라내는 기준이
+    갈리면 회수 쪽이 답을 버리고 본 루프만 성공하는 구멍이 생긴다.
+    """
+    _TUI_RESET.clear()
+    started = time.time()
+    hard_deadline = started + TUI_ANSWER_TIMEOUT
+    last_progress = started
+    last_emit = started
+    seen_rows = 0
+    reported = []
+    stop_reason = None
+    last_progress_line = None
+    # on_progress 가 돌려주는 배달 모드. "anchor" = 말풍선 1통을 고쳐 쓰는 중,
+    #   "message" = 새 말풍선 경로(앵커 실패·기능 OFF), "" = 아직 한 통도 안 보냄.
+    progress_mode = ""
+
+    def _emit_progress():
+        nonlocal last_emit, last_progress_line, progress_mode
+        if not on_progress:
+            return
+        now = time.time()
+        # dedup 기준선은 ★시계를 뺀 문장이다 — 시계를 넣으면 매번 달라져 dedup 이 죽는다.
+        base = _tui_progress_line(reported)
+        use_anchor = bool(TUI_PROGRESS_ANCHOR) and progress_mode != "message"
+        line = _tui_progress_line(reported, now - started) if use_anchor else base
+        # T-260823-001: 같은 문장을 1분마다 다시 보내지 않는다.
+        #   직전 발신과 같으면 타이머만 돌리고 폰에는 안 찍는다. 행동이 바뀌면 1통.
+        #   ★앵커 편집 경로는 예외다 (T-260824-042): 편집은 말풍선을 안 늘리고 알림도
+        #     안 띄우므로, 같은 단계여도 시계를 갱신하는 편이 「살아있다」의 증거다.
+        if not use_anchor and base == last_progress_line:
+            last_emit = now
+            return
+        try:
+            progress_mode = on_progress(line) or "message"
+            last_progress_line = base
+        except Exception as exc:  # noqa: BLE001
+            print(f"{TUI_LOG_KEY} 진행 발신 실패: {exc}", file=sys.stderr)
+        last_emit = time.time()
+
+    def _progress_interval():
+        """첫 통까지는 조용히(60s), 앵커가 생긴 뒤엔 촘촘히(30s) 고쳐 쓴다."""
+        if progress_mode == "anchor":
+            return TUI_PROGRESS_EDIT_INTERVAL
+        return TUI_PROGRESS_INTERVAL
+
+    while True:
+        if _TUI_RESET.is_set():
+            raise GrokExecError("/clear 로 레인을 되세웠다")
+        rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
+        fresh = rows[baseline:]
+        # ★진전 신호 = 히스토리 행 증가. reasoning·tool_call·tool_result 전부 포함한다
+        #   (최종답변 행만 세면 도구를 오래 쓰는 턴이 「무진전」으로 잘린다 — 그게 원 증상이다).
+        #   이미 매 폴에서 읽던 값이라 추가 비용 0.
+        if len(fresh) > seen_rows:
+            seen_rows = len(fresh)
+            last_progress = time.time()
+        for name in _tui_tool_call_names(fresh):
+            if name not in reported:
+                reported.append(name)
+                # T-260821-039: 종전 문구는 "(거부 기대)" 였다. 도구가 열린 지금은 정반대라
+                #   로그가 진단을 거꾸로 이끈다(실측: 개방 검증 왕복에서 성공한 3종이
+                #   전부 "거부 기대" 로 찍혔다). 판정엔 무영향이고 문구만 바로잡는다.
+                print(f"{TUI_LOG_KEY} 도구 사용: {name}", file=sys.stderr)
+        finals = _tui_final_answer_rows(fresh)
+        if finals:
+            return str(finals[-1].get("content") or "").strip()
+        now = time.time()
+        if on_progress and now - last_emit >= _progress_interval():
+            _emit_progress()
+        # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
+        #   ★단, 이 턴에서 도구를 이미 썼으면 침묵은 생각·다음 도구 대기다. 실패로 뒤집으면
+        #     typing 이 꺼지고 폰엔 「고장난 줄」만 남는다(T-260822-068, 22:02~22:28 26분 무신호).
+        if now - last_progress >= TUI_IDLE_TIMEOUT and not _tui_tool_in_flight(fresh):
+            if reported:
+                last_progress = now
+                _emit_progress()
+            else:
+                stop_reason = f"{TUI_IDLE_TIMEOUT}s 동안 새 출력이 없었다(무진전)"
+                break
+        if now >= hard_deadline:
+            stop_reason = (
+                f"총 상한 {TUI_ANSWER_TIMEOUT}s 초과 — 계속 움직이는데 답이 안 끝났다"
+            )
+            break
+        time.sleep(TUI_POLL_INTERVAL)
+
+    # T-260823-007: 잘린 직후 TUI 가 답을 마무리하면 그 답을 버린 채 다음 붙여넣기를
+    #   하지 않는다.
+    # T-260825-003: 창의 정본은 유예. max(유예, 총상한) 은 무진전 컷 뒤에도 2시간을
+    #   더 쥐었다. 총상한으로 잘렸고 진전이 있으면(T-260823-048) 유예 창을 진전마다
+    #   다시 연다. GRB_TUI_HARVEST_FOLLOW=0 이면 종전 max(유예, 총상한).
+    if TUI_LATE_HARVEST_GRACE > 0:
+        follow = bool(TUI_HARVEST_FOLLOW) and stop_reason and "총 상한" in stop_reason
+        if TUI_HARVEST_FOLLOW:
+            harvest_until = time.time() + TUI_LATE_HARVEST_GRACE
+        else:
+            harvest_until = time.time() + max(
+                TUI_LATE_HARVEST_GRACE, TUI_ANSWER_TIMEOUT
+            )
+        seen_harvest = seen_rows
+        while time.time() < harvest_until:
+            if _TUI_RESET.is_set():
+                raise GrokExecError("/clear 로 레인을 되세웠다")
+            rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
+            fresh = rows[baseline:]
+            if follow and (
+                len(fresh) > seen_harvest or _tui_tool_in_flight(fresh)
+            ):
+                seen_harvest = max(seen_harvest, len(fresh))
+                harvest_until = time.time() + TUI_LATE_HARVEST_GRACE
+            finals = _tui_final_answer_rows(fresh)
+            if finals:
+                print(
+                    f"{TUI_LOG_KEY} 늦은 회수 ({stop_reason})",
+                    file=sys.stderr,
+                )
+                return str(finals[-1].get("content") or "").strip()
+            now = time.time()
+            if on_progress and now - last_emit >= _progress_interval():
+                _emit_progress()
+            time.sleep(TUI_POLL_INTERVAL)
+
+    suffix = f" (도구 시도: {', '.join(reported[:3])})" if reported else ""
+    # ★조용히 자르지 않는다 (T-260824-028). 이 사고의 진짜 피해는 「잘린 것」이 아니라
+    #   「왜 잘렸는지 아무도 모른 것」이었다. 답이 없어 보이면 ★보던 일기장부터 의심한다.
+    #   실사고: 터미널은 27초 만에 답 완성, 폰엔 「180s 무진전」 — 다른 파일을 보고 있었다.
+    diag = ""
+    try:
+        diag = tui_rotation_diagnosis()
+    except Exception as exc:  # noqa: BLE001
+        diag = f"(세션 갈림 판정 실패: {exc})"
+    # ★진단이 「갈렸다」를 말하는 ★그 자리에서 핀을 옮기고 답을 건진다 (T-260825-003).
+    #   종전은 갈림을 문구로만 알리고 끝나서, 답이 살아있는 일기장에 멀쩡히 적혀 있어도
+    #   버려졌고 ★다음 턴도 같은 죽은 파일을 봤다.
+    moved = False
+    if rescue_prompt:
+        try:
+            rescued, moved = _tui_rescue_after_rotation(rescue_prompt, started)
+        except Exception as exc:  # noqa: BLE001
+            rescued = ""
+            print(f"{TUI_LOG_KEY} 갈림 회수 실패: {exc}", file=sys.stderr)
+        if rescued:
+            return rescued
+    if diag:
+        diag = " · " + diag
+    if moved:
+        diag += " · ★핀을 살아있는 대화로 옮겼다 — 다시 물어보면 그쪽에서 답한다"
+    raise GrokExecError(f"tmux 세션에서 답이 안 왔다 — {stop_reason}{suffix}{diag}")
+
+
+def run_grok_tui(prompt, on_progress=None, source=None):
     """상주 TUI 에 주입하고 세션 JSONL 에서 새 최종답변을 읽는다.
 
     ★화면(capture-pane)은 읽지 않는다 — crb 가 세운 계약이고, 화면은 렌더 폭·스크롤·
@@ -879,45 +1861,21 @@ def run_grok_tui(prompt):
 
     path = tui_history_path()
     baseline = len(_read_history_rows(path))
+    # 붙여넣기 전에 inflight 를 남긴다. 재기동이 이 턴을 회수하는 근거(T-260823-051).
+    _tui_inflight_write(
+        {
+            "session_id": session_id,
+            "baseline": baseline,
+            "source": source or _JOB_SOURCE or "telegram",
+            "preview": (prompt or "").strip().splitlines()[0][:80] if prompt else "",
+        }
+    )
     _tui_paste(prompt)
-
-    hard_deadline = time.time() + TUI_ANSWER_TIMEOUT
-    last_progress = time.time()
-    seen_rows = 0
-    reported = []
-    stop_reason = None
-    while True:
-        fresh = _read_history_rows(path)[baseline:]
-        # ★진전 신호 = 히스토리 행 증가. reasoning·tool_call·tool_result 전부 포함한다
-        #   (최종답변 행만 세면 도구를 오래 쓰는 턴이 「무진전」으로 잘린다 — 그게 원 증상이다).
-        #   이미 매 폴에서 읽던 값이라 추가 비용 0.
-        if len(fresh) > seen_rows:
-            seen_rows = len(fresh)
-            last_progress = time.time()
-        for name in _tui_tool_call_names(fresh):
-            if name not in reported:
-                reported.append(name)
-                # T-260821-039: 종전 문구는 "(거부 기대)" 였다. 도구가 열린 지금은 정반대라
-                #   로그가 진단을 거꾸로 이끈다(실측: 개방 검증 왕복에서 성공한 3종이
-                #   전부 "거부 기대" 로 찍혔다). 판정엔 무영향이고 문구만 바로잡는다.
-                print(f"{TUI_LOG_KEY} 도구 사용: {name}", file=sys.stderr)
-        finals = _tui_final_answer_rows(fresh)
-        if finals:
-            return str(finals[-1].get("content") or "").strip(), None, session_id
-        now = time.time()
-        # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
-        if now - last_progress >= TUI_IDLE_TIMEOUT and not _tui_tool_in_flight(fresh):
-            stop_reason = f"{TUI_IDLE_TIMEOUT}s 동안 새 출력이 없었다(무진전)"
-            break
-        if now >= hard_deadline:
-            stop_reason = (
-                f"총 상한 {TUI_ANSWER_TIMEOUT}s 초과 — 계속 움직이는데 답이 안 끝났다"
-            )
-            break
-        time.sleep(TUI_POLL_INTERVAL)
-
-    suffix = f" (도구 시도: {', '.join(reported[:3])})" if reported else ""
-    raise GrokExecError(f"tmux 세션에서 답이 안 왔다 — {stop_reason}{suffix}")
+    # rescue_prompt = 실패했을 때 「이 답이 ★내 질문의 답인가」를 대조할 원문 (T-260825-003).
+    answer = _tui_wait_for_final(
+        path, baseline, on_progress=on_progress, rescue_prompt=prompt
+    )
+    return answer, None, session_id
 
 
 def _remember_session(chat_id, returned_sid):
@@ -925,10 +1883,10 @@ def _remember_session(chat_id, returned_sid):
         write_session_uuid(chat_id, returned_sid)
 
 
-def _execute_with_session(chat_id, prompt):
+def _execute_with_session(chat_id, prompt, on_progress=None):
     if CHAT_LANE == "tui":
         if tui_session_alive():
-            answer, cost_usd, _session_id = run_grok_tui(prompt)
+            answer, cost_usd, _session_id = run_grok_tui(prompt, on_progress=on_progress)
             return answer, cost_usd
         if not TUI_FALLBACK_HEADLESS:
             # ★fail-closed 가 기본이다. 보이는 세션이 죽었는데 조용히 안 보이는 레인으로
@@ -1125,7 +2083,7 @@ def _tg_chunks(text, limit):
         yield remaining
 
 
-def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None):
+def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None, telegram_method=None, message_id=None, telegram_code_entity=None):
     """Send one message straight to the Telegram Bot API.
 
     The maintainer's internal build routes delivery through a private message
@@ -1137,16 +2095,43 @@ def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_marku
     hints for the bus, and there is no bus to route to. reply_markup is
     forwarded on the first chunk only, so a confirm button can sit on the
     first message of a long answer.
+
+    telegram_method="editMessageText" rewrites one existing message instead of
+    posting a new one - that is how the progress line updates in place rather
+    than stacking a new bubble every minute. An edit is never chunked: a
+    message already has a fixed identity, so it is truncated to the API cap.
+
+    telegram_code_entity marks a copy-paste command bubble. The public build
+    turns that into a Telegram `pre` entity so the phone shows a copy button.
     """
     payload = str(body or "").strip()
     if not payload:
         return {"deliveries": []}
+    if telegram_method == "editMessageText" and message_id:
+        res = tg(
+            "editMessageText",
+            chat_id=CHAT_ID,
+            message_id=message_id,
+            text=payload[:TG_CHUNK],
+        )
+        if not res or not res.get("ok"):
+            print(f"telegram editMessageText 실패: {res}", file=sys.stderr)
+            return {"deliveries": [{"surface": SEND_SURFACE, "result": "failed"}]}
+        return {
+            "deliveries": [
+                {"surface": SEND_SURFACE, "result": "sent", "message_id": message_id}
+            ]
+        }
     deliveries = []
     first = True
     for chunk in _tg_chunks(payload, TG_CHUNK):
         extra = {}
         if first and reply_markup:
             extra["reply_markup"] = reply_markup
+        if telegram_code_entity:
+            extra["entities"] = json.dumps(
+                [{"type": "pre", "offset": 0, "length": len(chunk.encode("utf-16-le")) // 2}]
+            )
         first = False
         res = tg("sendMessage", chat_id=CHAT_ID, text=chunk, **extra)
         if not res or not res.get("ok"):
@@ -1173,6 +2158,32 @@ def _first_sent_message_id(mesh_result, surface=SEND_SURFACE):
             if mid:
                 return mid
     return None
+
+
+# 편집이 「먹었다」로 볼 결과 (T-260824-042). skipped_unchanged 를 실패로 읽으면
+#   같은 단계가 이어지는 턴마다 앵커를 버리고 새 말풍선을 띄운다 — 고치려던 증상 그대로다.
+#   발신 경로는 변화 없는 편집을 API 호출 전에 접고 이 결과를 돌려준다.
+_ANCHOR_EDIT_OK = frozenset({"sent", "skipped_unchanged"})
+
+
+def _tui_progress_anchor_edit(message_id, text, task_id=None, surface=SEND_SURFACE):
+    """앵커 말풍선 1통을 고쳐 쓴다. 실패면 False — 호출부가 앵커를 버린다.
+
+    실패하는 실경로가 있다: 사용자가 그 말풍선을 지웠거나, 48시간이 지나 편집이
+    막혔거나, 발신 예산·flood 쿨다운에 걸린 경우. 그때 조용히 멈추면 폰은 다시
+    「멈춘 것과 구분 안 되는 화면」이 되므로, 앵커를 버리고 새 통을 띄우게 한다.
+    """
+    result = deliver_mesh_event(
+        "report",
+        text,
+        task_id=task_id,
+        telegram_method="editMessageText",
+        message_id=message_id,
+    )
+    for delivery in (result or {}).get("deliveries", []):
+        if delivery.get("surface") == surface and delivery.get("result") in _ANCHOR_EDIT_OK:
+            return True
+    return False
 
 
 SUGGESTED_SURFACE = SEND_SURFACE
@@ -1208,20 +2219,46 @@ def split_suggested_reply(text):
     return body, reply
 
 
-def mirror_answer(source, text, task_id=None):
-    """본문 1통 + (있으면) 추천답변 버블 1통.
+def split_copy_content(text):
+    """Public build keeps commands in the prose.
 
-    ★버블 kind 가 copy_content 인 이유 = clb 의 버블도 send_copy_content 경로로
-    나간다(clb: "`<추천답변>` 버블도 같은 경로를 타서"). R-C4 가 그 kind 에
-    "헤더·구분선·백틱·꼬리말 없이 원문 그대로" 를 계약으로 걸어두므로, 사용자가
-    그대로 복사해 보낼 문장이 장식 없이 착지한다. mesh_group 도 억제라 그룹 로그에
-    '끝' 이 두 줄 찍히지 않는다.
+    The maintainer build splits copy-paste bubbles with the shared parser
+    from the sister bridge. That file is not in this package, so this public
+    copy does not split commands.
+    """
+    return text or "", []
+
+
+def mirror_answer(source, text, task_id=None):
+    """본문 1통 + (있으면) 명령 복붙 버블 N통 + (있으면) 추천답변 버블 1통.
+
+    발신 순서 = R-C8 4항: 남은 산문 → 복붙 버블 → 추천답변 버블.
+    명령 버블만 telegram_code_entity=true (복사 버튼). 추천답변 버블은 같은
+    kind=copy_content 여도 이 플래그가 없다 — 확인 버튼 문구이지 명령이 아니다.
+    ★kind 가 copy_content 인 이유 = clb 의 버블도 send_copy_content 경로로
+    나간다. R-C4 가 그 kind 에 "헤더·구분선·백틱·꼬리말 없이 원문 그대로" 를
+    걸어 두므로 장식 없이 착지한다. mesh_group 은 억제라 그룹 로그에 '끝' 이
+    두 줄 찍히지 않는다.
     """
     local_print(f"grok answer ({source}):\n{text}")
     body, suggested = (
         split_suggested_reply(text) if SUGGESTED_REPLY_SPLIT else (text, "")
     )
-    deliver_mesh_event("final", body, task_id=task_id)
+    body, copy_bubbles = split_copy_content(body)
+    if body or not copy_bubbles:
+        deliver_mesh_event("final", body, task_id=task_id)
+    for bubble in copy_bubbles:
+        deliver_mesh_event(
+            "copy_content",
+            bubble,
+            task_id=task_id,
+            telegram_code_entity=True,
+        )
+    if CHAT_LANE == "tui":
+        sid = (tui_session_id() or "").strip()
+        if sid:
+            n = len(_tui_final_answer_rows(_read_history_rows(tui_history_path())))
+            _tui_cursor_save(sid, n)
     if not suggested:
         # R-C9: 유효한 bubble ID 가 없으면 리액션도 만들지 않는다. 종전엔 버블이
         # 아예 없던 시절이라 본문 첫 chunk 에 👀 를 붙였는데, 그 자리는 규격이
@@ -1238,6 +2275,72 @@ def mirror_answer(source, text, task_id=None):
     set_eyes_reaction(CHAT_ID, _first_sent_message_id(bubble))
 
 
+def mirror_local_tui_turns():
+    """커서 이후의 최종답을, 그 답을 부른 질문과 함께 폰으로 올린다 (T-260824-036).
+
+    ★커서가 이 세션 것이 아니면 현재 개수로 baseline 만 잡고 0 을 돌려준다 — 켠 순간
+      과거 일기장이 통째로 폰에 쏟아지는 걸 막는다(harvest_orphaned_tui_finals 와 같은 계약).
+    """
+    if CHAT_LANE != "tui" or not TUI_MIRROR_LOCAL:
+        return 0
+    sid = (tui_session_id() or "").strip()
+    if not sid:
+        return 0
+    rows = _read_history_rows(tui_history_path())
+    finals = _tui_final_answer_indices(rows)
+    cur = _tui_cursor_load()
+    if cur.get("session_id") != sid:
+        _tui_cursor_save(sid, len(finals))
+        return 0
+    try:
+        already = int(cur.get("finals_sent") or 0)
+    except (TypeError, ValueError):
+        already = 0
+    sent = 0
+    for pos in finals[_tui_cursor_clamp(already, len(finals)) :]:
+        answer = str(rows[pos].get("content") or "").strip()
+        if not answer:
+            continue
+        question = ""
+        for back in range(pos - 1, -1, -1):
+            question = _tui_user_query_text(rows[back])
+            if question:
+                break
+        if question:
+            head = question[:TUI_MIRROR_LOCAL_PROMPT_MAX]
+            if len(question) > TUI_MIRROR_LOCAL_PROMPT_MAX:
+                head += " …"
+            deliver_mesh_event("report", f"터미널에서 물어본 것 — {head}")
+        print(f"{TUI_LOG_KEY} local mirror 배달", file=sys.stderr)
+        mirror_answer(TUI_MIRROR_LOCAL_SOURCE, answer)
+        sent += 1
+    # 보낼 게 0 건이었던 tick 도 커서를 전진시킨다 — 안 그러면 매번 같은 자리를 다시 읽는다.
+    _tui_cursor_save(sid, len(finals))
+    return sent
+
+
+def tui_local_mirror_ticker():
+    """일기장을 주기적으로 훔쳐본다. 폰발 턴이 도는 동안엔 비켜선다.
+
+    ★한 번의 예외로 스레드가 죽으면 그 뒤로는 조용히 아무것도 안 미러한다 — 침묵
+      실패가 제일 나쁘다(원칙 6). 예외는 찍고 다음 tick 으로 넘어간다.
+    """
+    while True:
+        time.sleep(TUI_MIRROR_LOCAL_INTERVAL)
+        try:
+            if _TUI_JOB_ACTIVE.is_set() or not GROK_LOCK.acquire(blocking=False):
+                continue
+            try:
+                tui_follow_session_rotation()
+                sent = mirror_local_tui_turns()
+            finally:
+                GROK_LOCK.release()
+            if sent:
+                print(f"{TUI_LOG_KEY} local mirror {sent}건", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{TUI_LOG_KEY} local mirror 실패: {exc}", file=sys.stderr)
+
+
 def mirror_error(source, text, task_id=None):
     msg = f"grok 호출 실패: {text}"
     local_print(f"{msg} ({source})")
@@ -1245,12 +2348,79 @@ def mirror_error(source, text, task_id=None):
 
 
 def process_job(source, text, task_id=None):
+    if CHAT_LANE == "tui" and slash_token(text) in TUI_RESET_TOKENS:
+        handle_tui_reset(source, task_id=task_id)
+        return
     mirror_prompt(source, text)
+    started = time.time()
     typing_stop = start_typing()
+    progress_sent = 0
+    # ── 진행 앵커 (T-260824-042) ────────────────────────────────────────────────
+    # 말풍선 1통을 잡아 두고 그 통만 고쳐 쓴다. dict 로 드는 이유 = 아래 두 클로저가
+    #   같은 상태를 읽고 쓴다(nonlocal 3개보다 이쪽이 읽힌다).
+    anchor = {"message_id": None, "edits": 0}
+
+    def on_progress(msg):
+        """진행 1회. 돌려주는 값 = 배달 모드("anchor"/"message") — 대기 루프가 이걸 보고
+        다음 갱신 간격을 고른다(앵커면 촘촘히, 새 말풍선이면 종전 그대로)."""
+        nonlocal progress_sent
+        if not msg:
+            return ""
+        if anchor["message_id"] and TUI_PROGRESS_ANCHOR:
+            if anchor["edits"] >= TUI_PROGRESS_EDIT_MAX:
+                # 상한 도달. 새 말풍선으로 흘려보내지 않는다 — 폭주 방지가 목적이므로
+                # 조용히 멈추되 앵커 자체는 유지해 마감 한 줄은 찍히게 둔다.
+                return "anchor"
+            if _tui_progress_anchor_edit(anchor["message_id"], msg, task_id=task_id):
+                anchor["edits"] += 1
+                return "anchor"
+            # 편집이 안 먹었다(원문 삭제·48h 초과·쿨다운). 앵커를 버리고 새로 띄운다.
+            print(f"{TUI_LOG_KEY} 진행 앵커 편집 실패 — 새 말풍선으로 되돌린다", file=sys.stderr)
+            anchor["message_id"] = None
+        if progress_sent >= TUI_PROGRESS_MAX:
+            return "message"
+        progress_sent += 1
+        result = deliver_mesh_event("report", msg, task_id=task_id)
+        if TUI_PROGRESS_ANCHOR:
+            mid = _first_sent_message_id(result)
+            if mid:
+                anchor["message_id"] = mid
+                anchor["edits"] = 0
+                return "anchor"
+        return "message"
+
+    def close_anchor(ok, reset=False):
+        """앵커를 마감한다. 편집이 실패해도 답 배달은 그대로 간다(non-fatal).
+
+        성공·실패·예외 어느 갈래로 끝나든 부른다 — 안 부르면 답이 온 뒤에도 위에
+        「아직 하고 있어」가 남아 화면이 거짓말을 한다(원칙 6).
+        """
+        if not anchor["message_id"] or not TUI_PROGRESS_ANCHOR:
+            return
+        try:
+            _tui_progress_anchor_edit(
+                anchor["message_id"],
+                _tui_progress_done_line(time.time() - started, ok=ok, reset=reset),
+                task_id=task_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"{TUI_LOG_KEY} 진행 앵커 마감 실패: {exc}", file=sys.stderr)
+        anchor["message_id"] = None
+
+    outcome = {"ok": False, "reset": False}
     try:
         with GROK_LOCK:
-            answer, _cost_usd = _execute_with_session(CHAT_ID, text)
+            global _JOB_SOURCE
+            _JOB_SOURCE = source or "telegram"
+            answer, _cost_usd = _execute_with_session(
+                CHAT_ID, text, on_progress=on_progress
+            )
+        outcome["ok"] = True
     except GrokExecError as exc:
+        if "레인을 되세웠" in str(exc):
+            print(f"{TUI_LOG_KEY} /clear 가 물린 잡을 접었다", file=sys.stderr)
+            outcome["reset"] = True
+            return
         mirror_error(source, str(exc), task_id=task_id)
         return
     except Exception as exc:  # noqa: BLE001
@@ -1259,21 +2429,38 @@ def process_job(source, text, task_id=None):
         return
     finally:
         typing_stop.set()
+        # ★return 이 먼저 도는 갈래(에러 2종)에서도 앵커는 닫힌다 — finally 라서.
+        close_anchor(outcome["ok"], reset=outcome["reset"])
     mirror_answer(source, answer, task_id=task_id)
+    _tui_inflight_clear()
 
 
 def job_worker():
+    try:
+        if CHAT_LANE == "tui":
+            _tui_wait_inflight_if_any()
+            harvested = harvest_orphaned_tui_finals()
+            if harvested:
+                print(f"{TUI_LOG_KEY} startup harvest {harvested}건", file=sys.stderr)
+            _tui_inflight_clear()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} startup harvest 실패: {exc}", file=sys.stderr)
     while True:
         job = JOBS.get()
         health_mark(last_job_started_at=time.time())
         try:
             source, text = job
+            # 미러는 이 플래그가 내려갈 때까지 비켜선다 (T-260824-036). process_job 은
+            # GROK_LOCK 을 놓은 뒤에 답을 배달·커서 갱신하므로 락만으로는 창이 남는다.
+            _TUI_JOB_ACTIVE.set()
             process_job(source, text)
         except Exception as exc:  # noqa: BLE001
             print(f"grok bridge worker 실패: {exc}", file=sys.stderr)
         finally:
+            _TUI_JOB_ACTIVE.clear()
             JOBS.task_done()
             health_mark(last_job_done_at=time.time(), done=1)
+
 
 
 def handle_message_text(text, source="telegram"):
@@ -1285,6 +2472,10 @@ def handle_message_text(text, source="telegram"):
         msg = "grok 헤드리스 모드 작동중"
         local_print(msg)
         deliver_mesh_event("ack", msg)
+        return
+
+    if CHAT_LANE == "tui" and slash_token(text) in TUI_RESET_TOKENS:
+        handle_tui_reset(source)
         return
 
     JOBS.put((source, text))
@@ -1842,6 +3033,16 @@ def start_workers():
     threading.Thread(
         target=health_ticker, daemon=True, name=f"grok-bridge-{NAME}-health"
     ).start()
+    if CHAT_LANE == "tui" and TUI_MIRROR_LOCAL:
+        threading.Thread(
+            target=tui_local_mirror_ticker,
+            daemon=True,
+            name=f"grok-bridge-{NAME}-tui-mirror",
+        ).start()
+        local_print(
+            f"grok-bridge[{NAME}] tui local mirror ON "
+            f"(interval={TUI_MIRROR_LOCAL_INTERVAL}s) — 터미널 직접 입력분도 폰으로 올린다"
+        )
     install_thread_dump_handler()
     health_mark(started_at=time.time())
     local_print(f"grok-bridge[{NAME}] health={HEALTH_FILE} inbox={INBOX_FILE}")
