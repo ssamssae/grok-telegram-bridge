@@ -260,7 +260,10 @@ def health_ticker():
         if depth > 0:
             snap = health_snapshot()
             idle = time.time() - (snap["last_job_done_at"] or snap["started_at"])
+            # T-260827-022: ts 를 앞에 박는다 — 무타임스탬프 로그가 2차 동결 forensic 을
+            #   막았다(pid 사슬 재기동 시각 특정 불가).
             print(
+                f"{time.strftime('%m-%d %H:%M:%S')} "
                 f"grok-bridge[{NAME}] backlog queue_depth={depth} "
                 f"enqueued={snap['enqueued']} done={snap['done']} "
                 f"since_last_done={idle:.0f}s worker_alive={snap['worker_alive']}",
@@ -732,6 +735,9 @@ TUI_ANSWER_TIMEOUT = int_env("GRB_TUI_ANSWER_TIMEOUT", 7200, minimum=1)
 #   GRB_TUI_HARVEST_FOLLOW=0 이면 종전 max(유예, 총상한).
 TUI_LATE_HARVEST_GRACE = int_env("GRB_TUI_LATE_HARVEST_GRACE", 60, minimum=0)
 TUI_HARVEST_FOLLOW = int_env("GRB_TUI_HARVEST_FOLLOW", 1, minimum=0)
+# T-260827-022: 취소·크래시로 죽은 턴 판정. 0 이면 종전(도구 쓴 턴은 총 상한까지 대기).
+TUI_DEAD_TURN_PROBE = int_env("GRB_TUI_DEAD_TURN_PROBE", 1, minimum=0)
+TUI_DEAD_TURN_PROBE_GAP = int_env("GRB_TUI_DEAD_TURN_PROBE_GAP", 3, minimum=0)
 # T-260825-003: /clear 가 GROK_LOCK 을 기다리면 물린 잡이 탈출구를 막는다.
 #   1(기본) = 락을 기다리지 않고 레인을 되세운다. 0 이면 종전(락을 기다림).
 TUI_RESET_STEAL = int_env("GRB_TUI_RESET_STEAL", 1, minimum=0)
@@ -1310,6 +1316,48 @@ def _tui_tool_call_names(rows):
     return names
 
 
+# 그록 TUI busy 마커 (실캡처 2026-08-27 제어 노드·macOS 노드): 턴 중엔 스피너 상태줄에 "[stop]",
+# 푸터에 "Esc:cancel" 이 뜨고 idle 이면 둘 다 사라진다. Claude/Codex 용 정본 판정기
+# (tmux-repl-busy.sh)는 이 마커를 모른다 — 그록 레인은 여기서 직접 본다.
+_TUI_BUSY_MARKERS = ("[stop]", "Esc:cancel")
+
+
+def _tui_repl_idle_probe():
+    """★죽은 턴 판정용 REPL idle 실측 (T-260827-022).
+
+    화면에서 읽는 것은 busy ★상태뿐이다 — 답 본문을 화면에서 읽지 않는 crb 계약
+    (run_grok_tui docstring)은 그대로다. 상태 판독은 배차 preflight 가 이미 쓰는
+    계기 축이다.
+
+    fail-safe = ★모르면 busy 다: capture 실패·빈 pane(살아있는 TUI 는 빈 화면이
+    없다)이면 False 로 대기를 유지한다. 죽은 턴을 못 놓는 비용(총 상한까지 인질)보다
+    산 턴을 자르는 비용이 크다 — 0·초록을 믿기 전에 계기 생존 증명(원칙 6).
+    """
+    if not TUI_DEAD_TURN_PROBE:
+        return False
+    try:
+        proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} idle probe capture 실패: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        return False
+    screen = proc.stdout or ""
+    if not screen.strip():
+        return False
+    return not any(marker in screen for marker in _TUI_BUSY_MARKERS)
+
+
+def _tui_turn_dead_confirmed():
+    """idle 2연속 일치 때만 True — 프레임 전환 순간의 1회 오독을 거른다."""
+    if not TUI_DEAD_TURN_PROBE:
+        return False
+    if not _tui_repl_idle_probe():
+        return False
+    time.sleep(TUI_DEAD_TURN_PROBE_GAP)
+    return _tui_repl_idle_probe()
+
+
 def _tui_elapsed_words(seconds):
     """경과시간을 사람 말로. 「3분 47초」 — 사용자 DM 은 숫자표(04:07)가 아니라 산문이다."""
     total = int(max(0, seconds))
@@ -1881,13 +1929,26 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
         # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
         #   ★단, 이 턴에서 도구를 이미 썼으면 침묵은 생각·다음 도구 대기다. 실패로 뒤집으면
         #     typing 이 꺼지고 폰엔 「고장난 줄」만 남는다(T-260822-068, 22:02~22:28 26분 무신호).
-        if now - last_progress >= TUI_IDLE_TIMEOUT and not _tui_tool_in_flight(fresh):
-            if reported:
-                last_progress = now
-                _emit_progress()
-            else:
+        if now - last_progress >= TUI_IDLE_TIMEOUT:
+            # ★죽은 턴 판정 (T-260827-022): 무진전 창이 열린 뒤 REPL 이 실측 idle 이면
+            #   이 턴은 취소·중단으로 끝난 것이다 — reported·tool_in_flight 와 무관하게
+            #   즉시 놓는다. 종전엔 도구를 한 번이라도 쓴 턴은 이 컷이 영구히 꺼져
+            #   취소된 턴이 워커를 총 상한(7200s)까지 인질로 잡았다 (실사고 2026-08-27
+            #   제어 노드 2회: 53m 취소 후 2h21m 동결 T-260827-001, 재기동 후 inflight
+            #   회수 대기가 같은 자리에서 재동결 — 「답이안와」 22:07 유실).
+            if _tui_turn_dead_confirmed():
+                stop_reason = (
+                    f"{TUI_IDLE_TIMEOUT}s 무진전 + REPL idle 2연속 실측 — "
+                    "턴이 취소·중단된 것으로 판정"
+                )
+                break
+            if not _tui_tool_in_flight(fresh) and not reported:
                 stop_reason = f"{TUI_IDLE_TIMEOUT}s 동안 새 출력이 없었다(무진전)"
                 break
+            # 살아있는 턴(REPL busy 실측) — 다음 무진전 창까지 프로브를 쉰다.
+            last_progress = now
+            if not _tui_tool_in_flight(fresh) and reported:
+                _emit_progress()
         if now >= hard_deadline:
             stop_reason = (
                 f"총 상한 {TUI_ANSWER_TIMEOUT}s 초과 — 계속 움직이는데 답이 안 끝났다"
