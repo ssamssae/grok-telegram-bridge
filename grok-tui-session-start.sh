@@ -336,7 +336,7 @@ printf '%s' "$CHAT_CWD" > "$CWD_FILE" || exit 2
 if [ "$REUSE_SESSION" = "1" ]; then
   _rw=("$TMUX_BIN" -L "$TMUX_SOCKET" respawn-window -k -t "$TMUX_SESSION" -c "$CHAT_CWD")
   [ -n "${GROK_HOME:-}" ] && _rw+=(-e "GROK_HOME=$GROK_HOME")
-  if "${_rw[@]}" ${CMD[@]+"${CMD[@]}"} 2>/dev/null; then
+  if ${_rw[@]+"${_rw[@]}"} ${CMD[@]+"${CMD[@]}"} 2>/dev/null; then
     echo "[grok-tui] 창만 갈아끼웠다 (세션 유지 — 붙어 있던 화면 안 끊김)"
   else
     echo "[grok-tui] ⚠️ respawn-window 실패 — 종전 kill+new 로 떨어진다" >&2

@@ -800,6 +800,16 @@ TUI_MIRROR_LOCAL_INTERVAL = float_env("GRB_TUI_MIRROR_LOCAL_INTERVAL", 5.0)
 TUI_MIRROR_LOCAL_SOURCE = "tui-local"
 # 질문 원문을 통째로 밀면 긴 붙여넣기가 폰을 덮는다. 답이 본체고 질문은 꼬리표다.
 TUI_MIRROR_LOCAL_PROMPT_MAX = int_env("GRB_TUI_MIRROR_LOCAL_PROMPT_MAX", 300)
+# ── 터미널 /clear 카드 (T-260826-026) ────────────────────────────────────────
+# 폰 /clear 는 handle_tui_reset 이 이미 카드를 보낸다. 터미널 슬래시 /clear|/new 는
+# 그록이 *같은 pid* 에서 새 UUIDv7 대화를 열 뿐이라 브릿지가 침묵했다.
+# 증거 = GROK_HOME/active_sessions.json 의 같은 pid + 다른 session_id.
+# 폰 --force 재기동은 pid 가 바뀌므로 이 감시기는 침묵(중복 카드 금지).
+TUI_CLEAR_WATCH = bool_env("GRB_TUI_CLEAR_WATCH", True)
+TUI_CLEAR_WATCH_INTERVAL = float_env("GRB_TUI_CLEAR_WATCH_INTERVAL", 1.0)
+TUI_CLEAR_CONFIRM = "세션 클리어됐어. 이어서 말하면 돼."
+_TUI_CLEAR_SEEN = {}
+_TUI_CLEAR_BASELINED = False
 
 
 def tui_session_id():
@@ -1099,11 +1109,119 @@ def handle_tui_reset(source="telegram", task_id=None):
     except GrokExecError as exc:
         mirror_error(source, str(exc), task_id=task_id)
         return
-    msg = "대화를 새로 열었어. 이어서 말하면 돼."
-    local_print(msg)
-    # kind=final. ack 는 R-C5 가 본문을 버리고 노드 이모지 1자만 보낸다
-    # (실사고: 폰 /clear 확인이 부엉이만 큼직하게 찍힘, T-260823-025).
-    deliver_mesh_event("final", msg, task_id=task_id)
+    notify_tui_cleared(task_id=task_id)
+
+
+def tui_active_sessions_path():
+    """그록이 지금 열어 둔 대화 목록. 계정 홈을 따른다 (T-260822-044).
+
+    GRB_ACTIVE_SESSIONS_FILE 은 테스트 스텁. 라이브는 <GROK_HOME>/active_sessions.json.
+    """
+    override = env("GRB_ACTIVE_SESSIONS_FILE")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser(GROK_HOME_EFFECTIVE), "active_sessions.json")
+
+
+def _read_active_sessions():
+    try:
+        with open(tui_active_sessions_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _adopt_tui_session(sid):
+    """핀을 새 uuid 로 옮긴다. 실패해도 카드 발신은 막지 않는다(가시성이 목적)."""
+    old = tui_session_id()
+    try:
+        if old and old != sid:
+            _write(TUI_SESSION_ID_FILE + ".prev", old)
+        _write(TUI_SESSION_ID_FILE, sid)
+    except OSError as exc:
+        print(f"{TUI_LOG_KEY} /clear 핀 이동 실패: {exc}", file=sys.stderr)
+        return False
+    print(f"{TUI_LOG_KEY} /clear 핀 {old or '-'} → {sid}", file=sys.stderr)
+    return True
+
+
+def notify_tui_cleared(task_id=None):
+    """클리어 확인 1통. kind=final — ack 는 R-C5 가 본문을 버리고 이모지 1자만 보낸다.
+
+    (실사고: 폰 /clear 확인이 부엉이만 큼직하게 찍힘, T-260823-025).
+    """
+    local_print(TUI_CLEAR_CONFIRM)
+    deliver_mesh_event("final", TUI_CLEAR_CONFIRM, task_id=task_id)
+
+
+def _active_sessions_for_cwd():
+    """이 브릿지 cwd 의 (pid → session_id). cwd 가 다른 그록(서브에이전트 등)은 버린다."""
+    try:
+        cwd = os.path.realpath(ensure_chat_cwd())
+    except OSError:
+        return {}
+    out = {}
+    for row in _read_active_sessions():
+        if not isinstance(row, dict):
+            continue
+        row_cwd = row.get("cwd") or ""
+        if not row_cwd:
+            continue
+        try:
+            if os.path.realpath(row_cwd) != cwd:
+                continue
+        except OSError:
+            continue
+        sid = str(row.get("session_id") or "").strip()
+        if not sid:
+            continue
+        try:
+            pid = int(row.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        out[pid] = sid
+    return out
+
+
+def watch_tui_local_clear():
+    """같은 pid 의 session_id 가 바뀌면 터미널 /clear|/new 다.
+
+    반환 = 이번에 보낸 카드 수(0 또는 1+). 헤드리스는 0.
+    첫 관측은 기준선만 찍고 카드를 안 보낸다 — 기동 직후 살아있는 대화를
+    '방금 클리어'로 오인하면 안 된다.
+    """
+    global _TUI_CLEAR_BASELINED
+    if CHAT_LANE != "tui":
+        return 0
+    now = _active_sessions_for_cwd()
+    if not _TUI_CLEAR_BASELINED:
+        _TUI_CLEAR_SEEN.clear()
+        _TUI_CLEAR_SEEN.update(now)
+        _TUI_CLEAR_BASELINED = True
+        return 0
+    sent = 0
+    for pid, sid in now.items():
+        old = _TUI_CLEAR_SEEN.get(pid)
+        if old and old != sid:
+            _adopt_tui_session(sid)
+            notify_tui_cleared()
+            sent += 1
+    _TUI_CLEAR_SEEN.clear()
+    _TUI_CLEAR_SEEN.update(now)
+    return sent
+
+
+def tui_local_clear_ticker():
+    """active_sessions.json 을 주기적으로 본다. 예외 1회가 감시를 죽이면 안 된다."""
+    while True:
+        time.sleep(TUI_CLEAR_WATCH_INTERVAL)
+        try:
+            sent = watch_tui_local_clear()
+            if sent:
+                print(f"{TUI_LOG_KEY} local /clear 카드 {sent}통", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{TUI_LOG_KEY} local /clear 감시 실패: {exc}", file=sys.stderr)
 
 
 def _read_history_rows(path):
@@ -2478,6 +2596,12 @@ def handle_message_text(text, source="telegram"):
         handle_tui_reset(source)
         return
 
+    # 자비스(시리) 음성 입력 가시화 (T-260827-024): fifo 로 들어온 [VOICE] 입력은
+    # 텔레그램 발화가 아니라 질문이 폰에 안 남는다 — enqueue 즉시 원문을 챗에 미러.
+    # telegram 발 [VOICE] 는 이미 사용자 말풍선이 있으므로 미러하지 않는다.
+    if source == "local" and text.startswith(VOICE_PROMPT_PREFIX):
+        deliver_mesh_event("final", f"음성 입력: {text[len(VOICE_PROMPT_PREFIX):]}")
+
     JOBS.put((source, text))
     health_mark(last_enqueue_at=time.time(), enqueued=1)
 
@@ -3043,6 +3167,12 @@ def start_workers():
             f"grok-bridge[{NAME}] tui local mirror ON "
             f"(interval={TUI_MIRROR_LOCAL_INTERVAL}s) — 터미널 직접 입력분도 폰으로 올린다"
         )
+    if CHAT_LANE == "tui" and TUI_CLEAR_WATCH:
+        threading.Thread(
+            target=tui_local_clear_ticker,
+            daemon=True,
+            name=f"grok-bridge-{NAME}-tui-clear",
+        ).start()
     install_thread_dump_handler()
     health_mark(started_at=time.time())
     local_print(f"grok-bridge[{NAME}] health={HEALTH_FILE} inbox={INBOX_FILE}")
