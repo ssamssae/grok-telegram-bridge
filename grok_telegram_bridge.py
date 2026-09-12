@@ -3194,7 +3194,7 @@ def mirror_local_tui_turns():
         if question:
             prompt = _turn_mirror.format_prompt_mirror(question)
             if prompt:
-                deliver_mesh_event("report", prompt)
+                deliver_mesh_event("report" if is_dispatch_prompt(question) else "final", prompt)
         print(f"{TUI_LOG_KEY} local mirror 배달", file=sys.stderr)
         mirror_answer(TUI_MIRROR_LOCAL_SOURCE, answer)
         sent += 1
