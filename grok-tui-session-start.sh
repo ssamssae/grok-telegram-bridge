@@ -118,7 +118,7 @@ fi
 mkdir -p "$STATE_DIR" "$CHAT_CWD" || exit 2
 
 session_alive() {
-  "$TMUX_BIN" -L "$TMUX_SOCKET" has-session -t "$TMUX_SESSION" 2>/dev/null
+  "$TMUX_BIN" -L "$TMUX_SOCKET" has-session -t "=$TMUX_SESSION" 2>/dev/null
 }
 
 # ── ④ 멱등 판정은 ★상태파일이 아니라 tmux 세션 실존이다 (제어 노드 실측 ④) ──────────
