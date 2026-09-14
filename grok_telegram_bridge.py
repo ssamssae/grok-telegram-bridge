@@ -761,28 +761,10 @@ TUI_DEAD_TURN_PROBE_GAP = int_env("GRB_TUI_DEAD_TURN_PROBE_GAP", 3, minimum=0)
 # T-260825-003: /clear 가 GROK_LOCK 을 기다리면 물린 잡이 탈출구를 막는다.
 #   1(기본) = 락을 기다리지 않고 레인을 되세운다. 0 이면 종전(락을 기다림).
 TUI_RESET_STEAL = int_env("GRB_TUI_RESET_STEAL", 1, minimum=0)
-# 폰에 「아직 살아있다」를 찍는 간격 (T-260822-068). typing 인디케이터가 안 보여도
-#   이 1줄이 중간보고가 된다. 이야기체 루트에 쌓이면 낡아 보이므로 너무 촘촘히 보내지 않는다.
+# 첫 진행은 요청을 받을 때 즉시 표시한다. 이후 같은 메시지만 갱신한다.
 TUI_PROGRESS_INTERVAL = int_env("GRB_TUI_PROGRESS_INTERVAL", 60, minimum=1)
-# 1분 간격이어도 26분 턴이면 26통. 상한을 같이 건다 (T-260822-068 폭주 방지).
-#   ★앵커 편집이 켜져 있으면 이 상한은 ★새 말풍선 수에만 걸린다 — 편집은 말풍선을
-#   안 늘리므로 여기서 세지 않는다 (T-260824-042).
-TUI_PROGRESS_MAX = int_env("GRB_TUI_PROGRESS_MAX", 4, minimum=1)
-# ── 진행 앵커 (T-260824-042, 사용자 요청 2026-08-24) ──────────────────────────
-# 종전: 진행 문장을 매번 ★새 말풍선으로 보냈다. 실측 폐해 둘 —
-#   ① 이야기체 루트에 「아직 하고 있어」가 쌓여 대화가 지저분해진다.
-#   ② 3시간 47분 멈춘 턴(T-260824-041 인접 실사고)에서도 문장이 똑같아 dedup 에
-#      걸려 폰엔 아무 변화가 없었다. 「살아있다」와 「멈췄다」가 같은 화면이었다.
-# 지금: 앵커 말풍선 1통을 띄우고 그 통만 editMessageText 로 고쳐 쓴다. 경과시간이
-#   같이 찍히므로 멈춘 턴은 초가 안 흐르는 게 아니라 ★단계가 안 바뀌는 걸로 보인다.
-#   0 이면 종전 동작(새 말풍선 누적) — 되돌리기 스위치다.
-TUI_PROGRESS_ANCHOR = int_env("GRB_TUI_PROGRESS_ANCHOR", 1, minimum=0)
-# 앵커가 생긴 뒤의 갱신 간격. 새 말풍선이 아니라 편집이라 촘촘해도 알림이 안 뜬다
-#   (텔레그램은 editMessageText 에 알림을 안 띄운다). 첫 통까지의 침묵은 여전히
-#   TUI_PROGRESS_INTERVAL 이 쥔다 — 60초는 조용히, 그 뒤부터 살아 움직인다.
 TUI_PROGRESS_EDIT_INTERVAL = int_env("GRB_TUI_PROGRESS_EDIT_INTERVAL", 30, minimum=5)
-# 편집 폭주 방지. 30초 × 240 = 2시간이면 ANSWER_TIMEOUT(7200s) 과 같은 자리다.
-TUI_PROGRESS_EDIT_MAX = int_env("GRB_TUI_PROGRESS_EDIT_MAX", 240, minimum=1)
+# GRB_TUI_PROGRESS_ANCHOR/MAX/EDIT_MAX의 과거 다중 말풍선 모드는 더 이상 사용하지 않는다.
 TUI_TOOL_PROGRESS_LABELS = {
     "grep": "코드 찾는 중",
     "read_file": "파일 읽는 중",
@@ -1217,6 +1199,7 @@ def handle_tui_reset(source="telegram", task_id=None):
       기계 주입을 막는다.
     """
     _TUI_RESET.set()
+    _close_local_progress()
     dropped = drain_pending_jobs()
     forget_suggested_replies()
     set_awaiting_human()
@@ -2260,12 +2243,15 @@ def process_injected_harvest(source, text, meta, task_id=None):
     except (TypeError, ValueError):
         baseline = 0
     typing_stop = start_typing()
+    progress = _GrokProgressAnchor(task_id)
+    progress.update(_tui_progress_line([], 0))
     waited_ok = False
     reason = ""
     try:
         with GROK_LOCK:
+            _close_local_progress()
             try:
-                _tui_wait_for_final(tui_history_path(), baseline, rescue_prompt=text)
+                _tui_wait_for_final(tui_history_path(), baseline, on_progress=progress.update, rescue_prompt=text, request_text=text)
                 waited_ok = True
             except GrokExecError as exc:
                 reason = str(exc)
@@ -2273,6 +2259,7 @@ def process_injected_harvest(source, text, meta, task_id=None):
                 reason = f"내부 오류: {exc}"
     finally:
         typing_stop.set()
+        progress.close(waited_ok, reset="레인을 되세웠" in reason)
     try:
         sent = harvest_orphaned_tui_finals(source, task_id=task_id)
     except Exception as exc:  # noqa: BLE001
@@ -2353,7 +2340,7 @@ def _tui_rescue_after_rotation(prompt, started_at):
     return "", True
 
 
-def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
+def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", request_text=""):
     """baseline 이후 최종답 1개를 기다린다. 없으면 GrokExecError.
 
     run_grok_tui 와 재기동 회수가 같은 대기 루프를 쓴다 — 잘라내는 기준이
@@ -2364,7 +2351,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
     hard_deadline = started + TUI_ANSWER_TIMEOUT
     last_progress = started
     last_history = started  # T-260831-013: 행이 실제로 붙은 시각. 소프트 idle 연장이 못 건드린다.
-    last_emit = started
+    last_emit = started - TUI_PROGRESS_INTERVAL
     seen_rows = 0
     reported = []
     stall_first_seen = {}
@@ -2375,6 +2362,19 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
     #   "message" = 새 말풍선 경로(앵커 실패·기능 OFF), "" = 아직 한 통도 안 보냄.
     progress_mode = ""
 
+    def _request_rows(rows):
+        if not request_text:
+            return rows
+        for idx, row in enumerate(rows):
+            if _tui_user_query_text(row) == request_text.strip():
+                following = rows[idx + 1:]
+                for stop, item in enumerate(following):
+                    if _tui_user_query_text(item):
+                        return following[:stop]
+                return following
+        # An older turn may finish between the busy insertion and its user row.
+        return []
+
     def _emit_progress():
         nonlocal last_emit, last_progress_line, progress_mode
         if not on_progress:
@@ -2382,15 +2382,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
         now = time.time()
         # dedup 기준선은 ★시계를 뺀 문장이다 — 시계를 넣으면 매번 달라져 dedup 이 죽는다.
         base = _tui_progress_line(reported)
-        use_anchor = bool(TUI_PROGRESS_ANCHOR) and progress_mode != "message"
-        line = _tui_progress_line(reported, now - started) if use_anchor else base
-        # T-260823-001: 같은 문장을 1분마다 다시 보내지 않는다.
-        #   직전 발신과 같으면 타이머만 돌리고 폰에는 안 찍는다. 행동이 바뀌면 1통.
-        #   ★앵커 편집 경로는 예외다 (T-260824-042): 편집은 말풍선을 안 늘리고 알림도
-        #     안 띄우므로, 같은 단계여도 시계를 갱신하는 편이 「살아있다」의 증거다.
-        if not use_anchor and base == last_progress_line:
-            last_emit = now
-            return
+        line = _tui_progress_line(reported, now - started)
         try:
             progress_mode = on_progress(line) or "message"
             last_progress_line = base
@@ -2399,7 +2391,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
         last_emit = time.time()
 
     def _progress_interval():
-        """첫 통까지는 조용히(60s), 앵커가 생긴 뒤엔 촘촘히(30s) 고쳐 쓴다."""
+        """즉시 첫 표시 후에는 같은 메시지를 기본 30초마다 갱신한다."""
         if progress_mode == "anchor":
             return TUI_PROGRESS_EDIT_INTERVAL
         return TUI_PROGRESS_INTERVAL
@@ -2408,7 +2400,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
         if _TUI_RESET.is_set():
             raise GrokExecError("/clear 로 레인을 되세웠다")
         rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
-        fresh = rows[baseline:]
+        fresh = _request_rows(rows[baseline:])
         # ★진전 신호 = 히스토리 행 증가. reasoning·tool_call·tool_result 전부 포함한다
         #   (최종답변 행만 세면 도구를 오래 쓰는 턴이 「무진전」으로 잘린다 — 그게 원 증상이다).
         #   이미 매 폴에서 읽던 값이라 추가 비용 0.
@@ -2442,13 +2434,16 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
                     continue
                 stall_alerted.add(call_id)
                 try:
-                    deliver_mesh_event(
-                        "report",
-                        _tui_stall_alert_line(detail, now - stall_first_seen[call_id]),
-                    )
+                    alert = _tui_stall_alert_line(detail, now - stall_first_seen[call_id])
+                    if on_progress:
+                        on_progress(alert)
+                    else:
+                        deliver_mesh_event("report", alert)
                 except Exception as exc:  # noqa: BLE001
                     print(f"{TUI_LOG_KEY} 박힘 경보 발신 실패: {exc}", file=sys.stderr)
-        if on_progress and now - last_emit >= _progress_interval():
+        stage_changed = _tui_progress_line(reported) != last_progress_line
+        if on_progress and (now - last_emit >= _progress_interval() or
+                            (stage_changed and now - last_emit >= 2)):
             _emit_progress()
         # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
         #   ★단, 이 턴에서 도구를 이미 썼으면 침묵은 생각·다음 도구 대기다. 실패로 뒤집으면
@@ -2505,7 +2500,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt=""):
             if _TUI_RESET.is_set():
                 raise GrokExecError("/clear 로 레인을 되세웠다")
             rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
-            fresh = rows[baseline:]
+            fresh = _request_rows(rows[baseline:])
             if follow and (
                 len(fresh) > seen_harvest or _tui_tool_in_flight(fresh)
             ):
@@ -2792,7 +2787,7 @@ def _tg_chunks(text, limit):
         yield remaining
 
 
-def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None, telegram_method=None, message_id=None, telegram_code_entity=None):
+def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None, telegram_method=None, message_id=None, telegram_code_entity=None, request_progress=False):
     """Send one message straight to the Telegram Bot API.
 
     The maintainer's internal build routes delivery through a private message
@@ -2876,16 +2871,12 @@ _ANCHOR_EDIT_OK = frozenset({"sent", "skipped_unchanged"})
 
 
 def _tui_progress_anchor_edit(message_id, text, task_id=None, surface=SEND_SURFACE):
-    """앵커 말풍선 1통을 고쳐 쓴다. 실패면 False — 호출부가 앵커를 버린다.
-
-    실패하는 실경로가 있다: 사용자가 그 말풍선을 지웠거나, 48시간이 지나 편집이
-    막혔거나, 발신 예산·flood 쿨다운에 걸린 경우. 그때 조용히 멈추면 폰은 다시
-    「멈춘 것과 구분 안 되는 화면」이 되므로, 앵커를 버리고 새 통을 띄우게 한다.
-    """
+    """같은 진행 메시지를 편집한다. 실패해도 새 메시지로 대체하지 않는다."""
     result = deliver_mesh_event(
         "report",
         text,
         task_id=task_id,
+        request_progress=True,
         telegram_method="editMessageText",
         message_id=message_id,
     )
@@ -3160,6 +3151,139 @@ def mirror_answer(source, text, task_id=None):
     set_eyes_reaction(CHAT_ID, _first_sent_message_id(bubble))
 
 
+class _GrokProgressAnchor:
+    """One request owns one progress message; ambiguous delivery never reposts it."""
+
+    def __init__(self, task_id=None):
+        self.task_id = task_id
+        self.started = time.time()
+        self.message_id = None
+        self.attempted = False
+        self.closed = False
+        self.last_text = None
+        self.last_edit = 0
+        self.lock = threading.RLock()
+
+    def update(self, text):
+        with self.lock:
+            if self.closed or not text:
+                return "anchor"
+            try:
+                if not self.attempted:
+                    self.attempted = True
+                    result = deliver_mesh_event("report", text, task_id=self.task_id, request_progress=True)
+                    self.message_id = _first_sent_message_id(result)
+                    if not self.message_id:
+                        print(f"{TUI_LOG_KEY} 진행 수신증 없음 — 중복 방지를 위해 재발송하지 않음", file=sys.stderr)
+                    self.last_text = text
+                    self.last_edit = time.time()
+                elif self.message_id and text != self.last_text:
+                    if _tui_progress_anchor_edit(self.message_id, text, task_id=self.task_id):
+                        self.last_text = text
+                        self.last_edit = time.time()
+            except Exception as exc:  # non-fatal; final answer must still be delivered
+                print(f"{TUI_LOG_KEY} 진행 갱신 실패: {exc}", file=sys.stderr)
+            return "anchor"
+
+    def close(self, ok, reset=False, text=None):
+        with self.lock:
+            if self.closed:
+                return
+            if self.message_id:
+                self.update(text or _tui_progress_done_line(
+                    time.time() - self.started, ok=ok, reset=reset))
+            self.closed = True
+
+
+_TUI_LOCAL_PROGRESS = {"session": None, "observed": 0, "key": None, "anchor": None}
+# T-260914-005: 같은 터미널 질문을 진행 중·최종답에서 두 번 보내지 않는다.
+_LOCAL_TUI_PROMPTS_SENT = set()
+
+
+def _close_local_progress():
+    anchor = _TUI_LOCAL_PROGRESS["anchor"]
+    if anchor:
+        anchor.close(False, reset=True)
+        _TUI_LOCAL_PROGRESS["anchor"] = None
+
+
+def _deliver_local_tui_prompt(question, key):
+    """터미널에 막 친 질문을 최종답 전에 폰으로 올린다 (T-260914-005)."""
+    global _LOCAL_TUI_PROMPTS_SENT
+    if not question or key in _LOCAL_TUI_PROMPTS_SENT:
+        return False
+    prompt = _turn_mirror.format_prompt_mirror(question)
+    if not prompt:
+        return False
+    kind = "report" if is_dispatch_prompt(question) else "final"
+    deliver_mesh_event(kind, prompt)
+    _LOCAL_TUI_PROMPTS_SENT.add(key)
+    print(f"{TUI_LOG_KEY} local prompt 즉시 배달", file=sys.stderr)
+    return True
+
+
+def _mark_phone_progress_observed(request_text=""):
+    """Do not reopen a phone request as a local turn after its worker exits."""
+    sid = (tui_session_id() or "").strip()
+    if not sid:
+        return
+    rows = _read_history_rows(tui_history_path())
+    observed = len(rows)
+    if request_text:
+        matches = [idx for idx, row in enumerate(rows)
+                   if _tui_user_query_text(row) == request_text.strip()]
+        if not matches:
+            return
+        observed = matches[-1] + 1
+    state = _TUI_LOCAL_PROGRESS
+    if state["session"] != sid:
+        _close_local_progress()
+        state.update(session=sid, observed=observed, key=None, anchor=None)
+    else:
+        state["observed"] = max(state["observed"], observed)
+
+
+def _observe_local_progress(sid, rows):
+    """Observe new local requests only; old history at attach is never replayed."""
+    state = _TUI_LOCAL_PROGRESS
+    if state["session"] != sid or len(rows) < state["observed"]:
+        if state["anchor"]:
+            state["anchor"].close(False, reset=True)
+        state.update(session=sid, observed=len(rows), key=None, anchor=None)
+        return
+    questions = [(idx, _tui_user_query_text(row)) for idx, row in enumerate(rows)]
+    questions = [(idx, text) for idx, text in questions if text]
+    if not questions:
+        state["observed"] = len(rows)
+        return
+    idx, question = questions[-1]
+    key = (sid, idx, question)
+    fresh = rows[idx + 1:]
+    complete = bool(_tui_final_answer_rows(fresh))
+    failed = any(row.get("type") == "error" for row in fresh if isinstance(row, dict))
+    if key != state["key"]:
+        if state["anchor"]:
+            state["anchor"].close(False, reset=True)
+        state.update(key=key, anchor=None)
+        if idx >= state["observed"] and not complete and not failed:
+            _deliver_local_tui_prompt(question, key)
+            state["anchor"] = _GrokProgressAnchor()
+    state["observed"] = len(rows)
+    anchor = state["anchor"]
+    if not anchor or anchor.closed:
+        return
+    if complete or failed:
+        anchor.close(complete and not failed, text="작업 중단 · 오류 발생" if failed else None)
+        return
+    details = _tui_tool_call_details(fresh)
+    stage = _tui_progress_line(details)
+    now = time.time()
+    if stage != getattr(anchor, "stage", None) or now - anchor.last_edit >= TUI_PROGRESS_EDIT_INTERVAL:
+        anchor.update(_tui_progress_line(details, now - anchor.started))
+        anchor.stage = stage
+
+
+
 def mirror_local_tui_turns():
     """커서 이후의 최종답을, 그 답을 부른 질문과 함께 폰으로 올린다 (T-260824-036).
 
@@ -3170,8 +3294,10 @@ def mirror_local_tui_turns():
         return 0
     sid = (tui_session_id() or "").strip()
     if not sid:
+        _close_local_progress()
         return 0
     rows = _read_history_rows(tui_history_path())
+    _observe_local_progress(sid, rows)
     finals = _tui_final_answer_indices(rows)
     cur = _tui_cursor_load()
     if cur.get("session_id") != sid:
@@ -3192,9 +3318,7 @@ def mirror_local_tui_turns():
             if question:
                 break
         if question:
-            prompt = _turn_mirror.format_prompt_mirror(question)
-            if prompt:
-                deliver_mesh_event("report" if is_dispatch_prompt(question) else "final", prompt)
+            _deliver_local_tui_prompt(question, (sid, back, question))
         print(f"{TUI_LOG_KEY} local mirror 배달", file=sys.stderr)
         mirror_answer(TUI_MIRROR_LOCAL_SOURCE, answer)
         sent += 1
@@ -3241,62 +3365,15 @@ def process_job(source, text, task_id=None):
     mirror_prompt(source, text)
     started = time.time()
     typing_stop = start_typing()
-    progress_sent = 0
-    # ── 진행 앵커 (T-260824-042) ────────────────────────────────────────────────
-    # 말풍선 1통을 잡아 두고 그 통만 고쳐 쓴다. dict 로 드는 이유 = 아래 두 클로저가
-    #   같은 상태를 읽고 쓴다(nonlocal 3개보다 이쪽이 읽힌다).
-    anchor = {"message_id": None, "edits": 0}
-
-    def on_progress(msg):
-        """진행 1회. 돌려주는 값 = 배달 모드("anchor"/"message") — 대기 루프가 이걸 보고
-        다음 갱신 간격을 고른다(앵커면 촘촘히, 새 말풍선이면 종전 그대로)."""
-        nonlocal progress_sent
-        if not msg:
-            return ""
-        if anchor["message_id"] and TUI_PROGRESS_ANCHOR:
-            if anchor["edits"] >= TUI_PROGRESS_EDIT_MAX:
-                # 상한 도달. 새 말풍선으로 흘려보내지 않는다 — 폭주 방지가 목적이므로
-                # 조용히 멈추되 앵커 자체는 유지해 마감 한 줄은 찍히게 둔다.
-                return "anchor"
-            if _tui_progress_anchor_edit(anchor["message_id"], msg, task_id=task_id):
-                anchor["edits"] += 1
-                return "anchor"
-            # 편집이 안 먹었다(원문 삭제·48h 초과·쿨다운). 앵커를 버리고 새로 띄운다.
-            print(f"{TUI_LOG_KEY} 진행 앵커 편집 실패 — 새 말풍선으로 되돌린다", file=sys.stderr)
-            anchor["message_id"] = None
-        if progress_sent >= TUI_PROGRESS_MAX:
-            return "message"
-        progress_sent += 1
-        result = deliver_mesh_event("report", msg, task_id=task_id)
-        if TUI_PROGRESS_ANCHOR:
-            mid = _first_sent_message_id(result)
-            if mid:
-                anchor["message_id"] = mid
-                anchor["edits"] = 0
-                return "anchor"
-        return "message"
-
-    def close_anchor(ok, reset=False):
-        """앵커를 마감한다. 편집이 실패해도 답 배달은 그대로 간다(non-fatal).
-
-        성공·실패·예외 어느 갈래로 끝나든 부른다 — 안 부르면 답이 온 뒤에도 위에
-        「아직 하고 있어」가 남아 화면이 거짓말을 한다(원칙 6).
-        """
-        if not anchor["message_id"] or not TUI_PROGRESS_ANCHOR:
-            return
-        try:
-            _tui_progress_anchor_edit(
-                anchor["message_id"],
-                _tui_progress_done_line(time.time() - started, ok=ok, reset=reset),
-                task_id=task_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"{TUI_LOG_KEY} 진행 앵커 마감 실패: {exc}", file=sys.stderr)
-        anchor["message_id"] = None
+    progress = _GrokProgressAnchor(task_id)
+    on_progress = progress.update
+    close_anchor = progress.close
+    on_progress(_tui_progress_line([], 0))
 
     outcome = {"ok": False, "reset": False}
     try:
         with GROK_LOCK:
+            _close_local_progress()
             global _JOB_SOURCE
             _JOB_SOURCE = source or "telegram"
             answer, _cost_usd = _execute_with_session(
@@ -3350,6 +3427,11 @@ def job_worker():
         except Exception as exc:  # noqa: BLE001
             print(f"grok bridge worker 실패: {exc}", file=sys.stderr)
         finally:
+            try:
+                if CHAT_LANE == "tui":
+                    _mark_phone_progress_observed(text)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{TUI_LOG_KEY} phone progress observation failed: {exc}", file=sys.stderr)
             _TUI_JOB_ACTIVE.clear()
             JOBS.task_done()
             health_mark(last_job_done_at=time.time(), done=1)
