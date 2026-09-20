@@ -271,6 +271,10 @@ session and let it be recreated.
 - It does not share code with the Claude or Codex bridges, so their settings,
   slash commands, and safety behaviors do not carry over.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT, matching the sibling bridges.
