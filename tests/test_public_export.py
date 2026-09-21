@@ -109,13 +109,14 @@ class PublicExportTest(unittest.TestCase):
         self.assertIn("entities", calls[0][1])
 
     def test_trailing_suggested_reply_is_split(self):
-        mod = load_bridge("grb_suggested")
         open_m = "<" + "추천답변" + ">"
         close_m = "</" + "추천답변" + ">"
-        self.assertEqual(
-            mod.split_suggested_reply("hello\n" + open_m + "yes" + close_m),
-            ("hello", "yes"),
-        )
+        marked = "hello\n" + open_m + "yes" + close_m
+        mod_off = load_bridge("grb_suggested_off")
+        self.assertFalse(mod_off.SUGGESTED_REPLY_SPLIT)
+        self.assertEqual(mod_off.split_suggested_reply(marked), ("hello", ""))
+        mod = load_bridge("grb_suggested", GRB_SUGGESTED_REPLY_SPLIT="1")
+        self.assertEqual(mod.split_suggested_reply(marked), ("hello", "yes"))
         self.assertEqual(mod.split_suggested_reply("hello"), ("hello", ""))
         self.assertEqual(
             mod.split_suggested_reply("see " + open_m + "no" + close_m + " in the middle"),

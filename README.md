@@ -61,9 +61,11 @@ You do not get a wall of tool output. What you do get:
 - **Copy-paste command bubbles.** If the answer includes a command you are
   meant to run yourself, that command is sent as its own message with Telegram's
   copy button, not buried in the prose.
-- **A suggested-reply bubble.** If the answer ends with a trailing suggestion
-  marker, that suggestion is a second message with a confirm button. Pressing
-  the button sends the suggestion back into the same Grok session.
+- **Suggested-reply bubbles are off by default.** If you opt in with
+  `GRB_SUGGESTED_REPLY_SPLIT=1`, a trailing suggestion marker becomes a second
+  message. `GRB_SUGGESTED_CONFIRM=1` adds a button that submits that text back
+  into the same Grok session. When the split is off, the marker is stripped
+  and not shown.
 - **One progress line, edited in place** (TUI lane). While a long turn is still
   running, the phone shows a single status message that gets rewritten, instead
   of a new bubble every minute.
@@ -270,10 +272,6 @@ session and let it be recreated.
 - It does not ask before acting. There is no approval prompt.
 - It does not share code with the Claude or Codex bridges, so their settings,
   slash commands, and safety behaviors do not carry over.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

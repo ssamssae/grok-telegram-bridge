@@ -84,9 +84,11 @@ TYPING_INTERVAL = int_env("GRB_TYPING_INTERVAL", 4, minimum=1)
 DRY_RUN = bool_env("GRB_DRY_RUN", False)
 # 👀 는 요청 범위 밖 — 기본 off. 켜려면 GRB_SUGGESTED_REPLY_EYES=1.
 SUGGESTED_REPLY_EYES = bool_env("GRB_SUGGESTED_REPLY_EYES", False)
-# T-260822-052 — 사용자 직지(2026-08-22 15:2x): 본문에서 <추천답변> 태그를 빼고 버블을 따로 보낸다.
-#   T-260822-041 의 「원문 1통」 기본은 이 지시로 뒤집힘. 끄려면 GRB_SUGGESTED_REPLY_SPLIT=0.
-SUGGESTED_REPLY_SPLIT = bool_env("GRB_SUGGESTED_REPLY_SPLIT", True)
+# T-260921-019 — 코덱스 T-260921-018 과 같이 추천 버블·확인 버튼은 기본 off.
+#   켜려면 GRB_SUGGESTED_REPLY_SPLIT=1. 꺼진 동안에는 꼬리 태그도 본문에 남기지 않는다.
+SUGGESTED_REPLY_SPLIT = bool_env("GRB_SUGGESTED_REPLY_SPLIT", False)
+# 확인 버튼이 추천 문구를 다음 입력으로 넣는다. 기본 off. 켜려면 GRB_SUGGESTED_CONFIRM=1.
+SUGGESTED_REPLY_CONFIRM = bool_env("GRB_SUGGESTED_CONFIRM", False)
 LOCAL_INPUT = env(
     "GRB_LOCAL_INPUT",
     os.path.join(STATE_DIR, f"grok-bridge-{NAME}.fifo") if hasattr(os, "mkfifo") else "0",
@@ -2687,7 +2689,7 @@ def take_suggested_reply(cid):
 
 
 def suggested_confirm_markup(cid):
-    if not cid:
+    if not cid or not SUGGESTED_REPLY_CONFIRM:
         return ""
     return json.dumps(
         {
@@ -2748,6 +2750,9 @@ def handle_telegram_callback(callback):
         return
     if is_awaiting_human():
         answer("클리어 뒤라 이전 버튼은 안 먹어")
+        return
+    if not SUGGESTED_REPLY_CONFIRM:
+        answer("확인 버튼이 꺼져 있습니다.")
         return
     data = str(cb.get("data") or "")
     prefix = f"{SUGGESTED_CALLBACK_PREFIX}:"
@@ -2898,7 +2903,7 @@ def split_suggested_reply(text):
     Only a marker at the very end of the answer is a suggestion. A marker in
     the middle of the prose is left in the body. The maintainer private
     parser has more repair rules; this public copy only implements the tail
-    split, which is what the confirm-button bubble needs.
+    split. Suggestions stay off unless GRB_SUGGESTED_REPLY_SPLIT=1.
     """
     raw = text or ""
     stripped = raw.rstrip()
@@ -2914,6 +2919,8 @@ def split_suggested_reply(text):
     body = stripped[:open_at].rstrip()
     if not reply:
         return raw, ""
+    if not SUGGESTED_REPLY_SPLIT:
+        return (body if body else ""), ""
     if not body:
         return raw, ""
     return body, reply
@@ -3117,9 +3124,7 @@ def mirror_answer(source, text, task_id=None):
     if photos:
         deliver_photos(photos)
         text = strip_generated_image_refs(text, photos)
-    body, suggested = (
-        split_suggested_reply(text) if SUGGESTED_REPLY_SPLIT else (text, "")
-    )
+    body, suggested = split_suggested_reply(text)
     body, copy_bubbles = split_copy_content(body)
     if body or (not copy_bubbles and not photos):
         deliver_mesh_event("final", body, task_id=task_id)
