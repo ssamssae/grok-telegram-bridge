@@ -84,10 +84,8 @@ TYPING_INTERVAL = int_env("GRB_TYPING_INTERVAL", 4, minimum=1)
 DRY_RUN = bool_env("GRB_DRY_RUN", False)
 # 👀 는 요청 범위 밖 — 기본 off. 켜려면 GRB_SUGGESTED_REPLY_EYES=1.
 SUGGESTED_REPLY_EYES = bool_env("GRB_SUGGESTED_REPLY_EYES", False)
-# T-260921-019 — 코덱스 T-260921-018 과 같이 추천 버블·확인 버튼은 기본 off.
-#   켜려면 GRB_SUGGESTED_REPLY_SPLIT=1. 꺼진 동안에는 꼬리 태그도 본문에 남기지 않는다.
+# Suggested-reply bubbles and confirm buttons stay off unless you opt in.
 SUGGESTED_REPLY_SPLIT = bool_env("GRB_SUGGESTED_REPLY_SPLIT", False)
-# 확인 버튼이 추천 문구를 다음 입력으로 넣는다. 기본 off. 켜려면 GRB_SUGGESTED_CONFIRM=1.
 SUGGESTED_REPLY_CONFIRM = bool_env("GRB_SUGGESTED_CONFIRM", False)
 LOCAL_INPUT = env(
     "GRB_LOCAL_INPUT",
