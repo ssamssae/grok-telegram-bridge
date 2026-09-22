@@ -6,6 +6,17 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it does not share runtime code with either.
 
+## New in 0.6.0
+
+Send `/model` for model-selection buttons, or `/model <model-id>` to switch the
+connected Grok TUI session. The CLI supplies the available models. Changing a
+model also changes the CLI default. The bridge protects active work and drafts,
+and confirms a switch from session metadata. Headless switching is unsupported.
+
+Normal Telegram inputs also remind Grok not to append unsolicited suggested
+replies. Existing terminal output and direct terminal input are unaffected.
+See [release notes](RELEASE_NOTES-0.6.0.md) for upgrade details.
+
 ## Read This First
 
 **This bridge gives a chat app the ability to run commands on your computer.**
