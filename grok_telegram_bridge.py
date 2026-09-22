@@ -1394,7 +1394,7 @@ def _tui_user_query_text(row):
         end = text.find(_USER_QUERY_CLOSE, start)
         body = text[start + len(_USER_QUERY_OPEN) : end if end >= 0 else None]
         if body.strip():
-            return body.strip()
+            return strip_reply_style_instruction(body.strip())
     return ""
 
 
@@ -1721,23 +1721,50 @@ def _tui_stall_alert_line(detail, seconds):
     )
 
 
-def _tui_progress_done_line(elapsed, ok=True, reset=False):
+def _tui_failure_reason_label(reason):
+    """실패 앵커에 넣을 오류종류. 긴 진단의 앞머리만 걷는다.
+
+    intern-ops 가 kind=error 를 드롭해도 이 한 줄은 kind=report 라 폰에 남는다
+    (T-260921-034). 「사유는 아래」는 아래가 비면 거짓이다.
+    """
+    text = " ".join(str(reason or "").split())
+    if not text:
+        return ""
+    prefixes = (
+        "tmux 세션에서 답이 안 왔다 — ",
+        "grok 호출 실패: ",
+    )
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if " (도구 시도:" in text:
+        text = text.split(" (도구 시도:", 1)[0]
+    if len(text) > 180:
+        text = text[:177] + "…"
+    return text
+
+
+def _tui_progress_done_line(elapsed, ok=True, reset=False, reason=None):
     """앵커 마감 한 줄. 답 본문은 기존 mirror_answer 가 따로 배달한다.
 
     앵커를 그냥 두면 답이 온 뒤에도 「아직 하고 있어」가 위에 남는다 — 끝난 걸 끝났다고
     적어야 화면이 거짓말을 안 한다(원칙 6). 도구 목록은 안 싣는다: 바로 아래에 답이
     붙으므로 여기서 되풀이하면 같은 말을 두 번 하는 화면이 된다.
 
-    ★실패 턴을 「다 했어」로 닫지 않는다 — 에러 메시지는 따로 가는데 앵커만 초록이면
-      화면 두 줄이 서로 다른 말을 한다. 사유는 안 싣는다(에러 통이 이미 싣는다).
+    ★실패 턴을 「다 했어」로 닫지 않는다 — 오류종류를 이 줄에 싣는다. 에러 통이
+      intern-ops 로 드롭되면 「사유는 아래」는 빈칸이 된다 (T-260921-034).
     ★/clear 로 접힌 턴은 에러 통이 안 따라온다 (process_job 이 mirror_error 없이
-      return). 「사유는 아래」는 그때 거짓이다. handle_tui_reset ack 와 겹치지 않게
-      이 말풍선만 「이 턴은 접었다」고 마감한다 (T-260825-003 회신).
+      return). handle_tui_reset ack 와 겹치지 않게 이 말풍선만 「이 턴은 접었다」고
+      마감한다 (T-260825-003 회신).
     """
     if reset:
         return f"중단 · {_tui_elapsed_words(elapsed)} 만에"
     if not ok:
-        return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에 (사유는 아래)"
+        label = _tui_failure_reason_label(reason)
+        if label:
+            return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에 — {label}"
+        return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에"
     return f"응답 종료 · {_tui_elapsed_words(elapsed)} 걸림"
 
 
@@ -2117,7 +2144,28 @@ def _tui_clear_composer():
     _tmux("send-keys", "-t", TMUX_PANE, "C-c")
     time.sleep(TUI_SUBMIT_DELAY)
 
-def _tui_paste(prompt, before_submit=None):
+REPLY_STYLE_INSTRUCTION = (
+    "[Grok bridge reply style] 사용자 지시: 답변 끝에 추천답변 태그·복사용 후속 답변·확인 문구를 "
+    "자동으로 붙이지 않는다. 이전 대화의 추천답변 작성 지시보다 이 지시를 우선한다. "
+    "사용자가 답장 초안을 명시적으로 요청한 경우에만 요청한 내용을 제공한다."
+)
+
+
+def with_reply_style_instruction(text):
+    raw = text or ""
+    if not raw.strip() or raw.lstrip().startswith("/") or is_dispatch_prompt(raw):
+        return raw
+    if raw.endswith(REPLY_STYLE_INSTRUCTION):
+        return raw
+    return raw + "\n\n" + REPLY_STYLE_INSTRUCTION
+
+
+def strip_reply_style_instruction(text):
+    suffix = "\n\n" + REPLY_STYLE_INSTRUCTION
+    return text[:-len(suffix)] if text.endswith(suffix) else text
+
+
+def _tui_paste(prompt, before_submit=None, *, confirm_submit=True, clear_composer=True):
     """crb 와 같은 tmux 3단(load-buffer → paste-buffer → 제출키).
 
     send-keys 로 본문을 직접 타이핑하지 않는 이유는 crb 와 같다 — 여러 줄·특수문자가
@@ -2127,7 +2175,7 @@ def _tui_paste(prompt, before_submit=None):
     pasteboard 재주입 = `_isolate_os_clipboard_images` 가 제출키까지 감싼다
     (T-260824-006). 둘 중 하나만 있으면 「안녕하세요 [Image #1]」 가 되살아난다.
     """
-    payload = (prompt or "").rstrip("\n")
+    payload = with_reply_style_instruction((prompt or "").rstrip("\n"))
     if not payload:
         raise GrokExecError("TUI 에 보낼 질문이 비어 있다")
     # ★붙여넣기 직전에 「보는 일기장이 맞나」를 확인한다 (T-260824-028).
@@ -2150,12 +2198,17 @@ def _tui_paste(prompt, before_submit=None):
     if before_submit:
         before_submit(session_id, path, baseline)
     with _isolate_os_clipboard_images():
-        _tui_clear_composer()
+        if clear_composer:
+            _tui_clear_composer()
+        else:
+            # Empty composer was checked by model control; focus without cancelling.
+            _tmux("send-keys", "-t", TMUX_PANE, "Space", "BSpace")
         _tmux("load-buffer", "-", input_text=payload)
         _tmux("paste-buffer", "-p", "-t", TMUX_PANE)
         time.sleep(TUI_SUBMIT_DELAY)
         _tui_send_submit_key()
-        _tui_confirm_submit(payload, baseline)
+        if confirm_submit:
+            _tui_confirm_submit(payload, baseline)
     return session_id, path, baseline
 
 
@@ -2167,7 +2220,7 @@ def _tui_interrupt_paste(prompt):
     글이 씹히거나 취소 패널만 열린다. Space 는 스크롤백 초점을 입력칸으로
     옮긴다. 사진 칩은 `_isolate_os_clipboard_images` 가 가린다.
     """
-    payload = (prompt or "").rstrip("\n")
+    payload = with_reply_style_instruction((prompt or "").rstrip("\n"))
     if not payload:
         return
     baseline = len(_read_history_rows(tui_history_path()))
@@ -2259,7 +2312,11 @@ def process_injected_harvest(source, text, meta, task_id=None):
                 reason = f"내부 오류: {exc}"
     finally:
         typing_stop.set()
-        progress.close(waited_ok, reset="레인을 되세웠" in reason)
+        progress.close(
+            waited_ok,
+            reset="레인을 되세웠" in reason,
+            reason=None if waited_ok else reason,
+        )
     try:
         sent = harvest_orphaned_tui_finals(source, task_id=task_id)
     except Exception as exc:  # noqa: BLE001
@@ -2728,6 +2785,113 @@ def mark_suggested_pressed(chat_id, message_id):
         print(f"suggested button mark 실패: {exc}", file=sys.stderr)
 
 
+MODEL_CALLBACK_PREFIX = "grb-model:"
+MODEL_VERIFY_TIMEOUT = 3.0
+
+
+def available_models():
+    """Ask this account's CLI catalog; never invent available model IDs."""
+    proc = subprocess.run(
+        [GROK_BIN, "models"], capture_output=True, text=True, timeout=15,
+        stdin=subprocess.DEVNULL, env=grok_child_env(), cwd=ensure_chat_cwd(),
+    )
+    if proc.returncode:
+        raise GrokExecError("모델 목록을 읽지 못했습니다")
+    models = []
+    for line in proc.stdout.splitlines():
+        match = re.fullmatch(r"\s*[-*]\s+([A-Za-z0-9][A-Za-z0-9._:/-]*)(?:\s+\(default\))?\s*", line)
+        if match and match[1] not in models:
+            models.append(match[1])
+    if not models:
+        raise GrokExecError("CLI에서 선택 가능한 모델을 찾지 못했습니다")
+    return models
+
+
+def current_tui_model():
+    try:
+        path = os.path.join(os.path.dirname(tui_history_path()), "summary.json")
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return str(data.get("current_model_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def model_composer_empty():
+    """Only the observed boxed, empty Grok composer permits a control command."""
+    proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+    if proc.returncode:
+        return False
+    lines = (proc.stdout or "").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if re.match(r"\s*│\s*❯", lines[index]):
+            return bool(re.fullmatch(r"\s*│\s*❯\s*│\s*", lines[index])) and (
+                index + 1 < len(lines) and lines[index + 1].lstrip().startswith("╰")
+            )
+    return False
+
+
+def handle_model_command(text):
+    parts = text.split(maxsplit=1)
+    if len(parts) == 2:
+        apply_model_choice(parts[1].strip())
+        return
+    try:
+        models = available_models()
+        current = current_tui_model() if CHAT_LANE == "tui" else ""
+        rows = [[{"text": ("✓ " if model == current else "") + model,
+                  "callback_data": MODEL_CALLBACK_PREFIX + model}]
+                for model in models if len((MODEL_CALLBACK_PREFIX + model).encode()) <= 64]
+        msg = (f"현재 세션 모델: {current or '미확인'}\n"
+               "모델을 선택하세요. CLI 기본 모델도 함께 변경됩니다.\n"
+               "직접 입력: /model <모델 ID>\n" + "\n".join(models))
+        deliver_mesh_event("copy_content", msg, reply_markup=json.dumps({"inline_keyboard": rows}))
+    except (GrokExecError, OSError, subprocess.SubprocessError):
+        deliver_mesh_event("copy_content", "모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.")
+
+
+def apply_model_choice(model):
+    """Model control has no assistant turn/history answer; verify CLI metadata instead."""
+    if is_awaiting_human():
+        deliver_mesh_event("copy_content", "클리어 뒤 대기 중입니다. 먼저 대화를 재개하세요.")
+        return
+    if CHAT_LANE != "tui":
+        deliver_mesh_event("copy_content", "모델 변경은 연결된 Grok TUI 세션에서 지원합니다.")
+        return
+    try:
+        if model not in available_models():
+            deliver_mesh_event("copy_content", "선택할 수 없는 모델입니다. /model 목록을 다시 확인하세요.")
+            return
+    except (GrokExecError, OSError, subprocess.SubprocessError):
+        deliver_mesh_event("copy_content", "모델 목록 조회 실패로 변경하지 않았습니다.")
+        return
+    if _TUI_JOB_ACTIVE.is_set() or not JOBS.empty() or not GROK_LOCK.acquire(blocking=False):
+        deliver_mesh_event("copy_content", "작업 중입니다. 끝난 뒤 모델을 선택하세요.")
+        return
+    try:
+        if not tui_session_alive() or not _tui_repl_idle_probe() or not model_composer_empty():
+            deliver_mesh_event("copy_content", "터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.")
+            return
+        tui_follow_session_rotation()
+        if current_tui_model() == model:
+            deliver_mesh_event("copy_content", f"현재 세션은 이미 {model}입니다.")
+            return
+        _tui_paste(f"/model {model}", confirm_submit=False, clear_composer=False)
+        deadline = time.monotonic() + MODEL_VERIFY_TIMEOUT
+        while True:
+            if current_tui_model() == model:
+                deliver_mesh_event("copy_content", f"모델 변경 확인: {model}\nCLI 기본 모델도 함께 변경됩니다.")
+                return
+            if time.monotonic() >= deadline:
+                deliver_mesh_event("copy_content", "모델 변경 결과 미확인. 자동 재전송하지 않았습니다. /model로 현재 상태를 확인하세요.")
+                return
+            time.sleep(0.1)
+    except (GrokExecError, OSError, subprocess.SubprocessError):
+        deliver_mesh_event("copy_content", "모델 변경 결과 미확인. 터미널 상태를 확인하세요.")
+    finally:
+        GROK_LOCK.release()
+
+
 def handle_telegram_callback(callback):
     """추천답변 확인 버튼. 문구를 그대로 다음 입력으로 넣는다."""
     cb = callback if isinstance(callback, dict) else {}
@@ -2748,6 +2912,11 @@ def handle_telegram_callback(callback):
         return
     if is_awaiting_human():
         answer("클리어 뒤라 이전 버튼은 안 먹어")
+        return
+    data = str(cb.get("data") or "")
+    if data.startswith(MODEL_CALLBACK_PREFIX):
+        answer()
+        apply_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
         return
     if not SUGGESTED_REPLY_CONFIRM:
         answer("확인 버튼이 꺼져 있습니다.")
@@ -3188,13 +3357,13 @@ class _GrokProgressAnchor:
                 print(f"{TUI_LOG_KEY} 진행 갱신 실패: {exc}", file=sys.stderr)
             return "anchor"
 
-    def close(self, ok, reset=False, text=None):
+    def close(self, ok, reset=False, text=None, reason=None):
         with self.lock:
             if self.closed:
                 return
             if self.message_id:
                 self.update(text or _tui_progress_done_line(
-                    time.time() - self.started, ok=ok, reset=reset))
+                    time.time() - self.started, ok=ok, reset=reset, reason=reason))
             self.closed = True
 
 
@@ -3359,6 +3528,10 @@ def mirror_error(source, text, task_id=None):
 
 
 def process_job(source, text, task_id=None):
+    if slash_token(text) == "/model":
+        handle_model_command(text)
+        return
+
     if CHAT_LANE == "tui" and slash_token(text) in TUI_RESET_TOKENS:
         handle_tui_reset(source, task_id=task_id)
         return
@@ -3373,7 +3546,7 @@ def process_job(source, text, task_id=None):
     close_anchor = progress.close
     on_progress(_tui_progress_line([], 0))
 
-    outcome = {"ok": False, "reset": False}
+    outcome = {"ok": False, "reset": False, "reason": None}
     try:
         with GROK_LOCK:
             _close_local_progress()
@@ -3388,16 +3561,18 @@ def process_job(source, text, task_id=None):
             print(f"{TUI_LOG_KEY} /clear 가 물린 잡을 접었다", file=sys.stderr)
             outcome["reset"] = True
             return
+        outcome["reason"] = str(exc)
         mirror_error(source, str(exc), task_id=task_id)
         return
     except Exception as exc:  # noqa: BLE001
         print(f"grok bridge 처리 실패: {exc}", file=sys.stderr)
+        outcome["reason"] = "내부 오류"
         mirror_error(source, "내부 오류", task_id=task_id)
         return
     finally:
         typing_stop.set()
         # ★return 이 먼저 도는 갈래(에러 2종)에서도 앵커는 닫힌다 — finally 라서.
-        close_anchor(outcome["ok"], reset=outcome["reset"])
+        close_anchor(outcome["ok"], reset=outcome["reset"], reason=outcome.get("reason"))
     mirror_answer(source, answer, task_id=task_id)
     _tui_inflight_clear()
 
@@ -3450,6 +3625,10 @@ def handle_message_text(text, source="telegram"):
         msg = "grok 헤드리스 모드 작동중"
         local_print(msg)
         deliver_mesh_event("ack", msg)
+        return
+
+    if slash_token(text) == "/model":
+        handle_model_command(text)
         return
 
     if CHAT_LANE == "tui" and slash_token(text) in TUI_RESET_TOKENS:
