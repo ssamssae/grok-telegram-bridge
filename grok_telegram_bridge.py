@@ -3388,7 +3388,8 @@ def _deliver_local_tui_prompt(question, key):
     if not prompt:
         return False
     kind = "report" if is_dispatch_prompt(question) else "final"
-    deliver_mesh_event(kind, prompt)
+    # Approved directives belong to the user request, not background status spam.
+    deliver_mesh_event(kind, prompt, request_progress=(kind == "report"))
     _LOCAL_TUI_PROMPTS_SENT.add(key)
     print(f"{TUI_LOG_KEY} local prompt 즉시 배달", file=sys.stderr)
     return True
