@@ -894,6 +894,9 @@ def tui_session_id():
 #     ④ 그 후보가 최근에 쓰였다 (FOLLOW_FRESH_SEC 이내)
 #   하나라도 어긋나면 추종하지 않고 ★진단만 돌려준다. 그 진단은 타임아웃 문구에 실려
 #   나간다 — 이 사고의 진짜 피해는 잘린 것이 아니라 ★조용히 잘린 것이었다.
+# 선택자 (T-261007-012): 같은 cwd 에서 더 최근에 쓰인 폴더를 후보로 고르지 않는다.
+# 입력 pane 프로세스와 active_sessions 의 session_id 가 같을 때만 핀을 유지하거나 옮긴다.
+# 같은 pid 의 session_id 변경은 따라간다. 소유가 없거나 둘 이상이면 다른 세션을 고르지 않는다.
 TUI_FOLLOW_STALE_SEC = int_env("GRB_TUI_FOLLOW_STALE_SEC", 90, minimum=1)
 TUI_FOLLOW_FRESH_SEC = int_env("GRB_TUI_FOLLOW_FRESH_SEC", 3600, minimum=1)
 # ★실패 ★순간의 추종·회수 (T-260825-003).
@@ -904,9 +907,6 @@ TUI_FOLLOW_FRESH_SEC = int_env("GRB_TUI_FOLLOW_FRESH_SEC", 3600, minimum=1)
 #   버려진다. 이 스위치가 그 틈을 닫는다: 진단이 rotated 를 말하는 자리에서 핀을 옮기고,
 #   살아있는 일기장에서 ★이 질문의 답을 건져 배달한다.
 TUI_RESCUE_ON_ROTATION = bool_env("GRB_TUI_RESCUE_ON_ROTATION", True)
-# 질문 대조에 쓰는 앞머리 길이. 짧으면 남의 답을 내 답으로 오인하고, 너무 길면 TUI 가
-# 줄바꿈·말줄임으로 다듬은 질문과 안 맞는다.
-TUI_RESCUE_MATCH_CHARS = int_env("GRB_TUI_RESCUE_MATCH_CHARS", 24, minimum=4)
 
 
 def _tui_sessions_root():
@@ -946,17 +946,136 @@ def _history_stat(session_uuid):
     return ("ok", float(st.st_mtime))
 
 
+def _tmux_pane_pid():
+    """입력 pane 의 pid. 못 읽으면 0. 다른 세션을 대신 고르지 않는다."""
+    try:
+        result = _tmux("display-message", "-p", "-t", TMUX_PANE, "#{pane_pid}")
+    except Exception:  # noqa: BLE001
+        return 0
+    if getattr(result, "returncode", 1) != 0:
+        return 0
+    text = (getattr(result, "stdout", "") or "").strip()
+    if not text.isdigit():
+        return 0
+    return int(text)
+
+
+def _read_process_tree():
+    """pid → ppid. 실패는 None. 빈 결과는 트리가 비었다는 뜻이다."""
+    try:
+        result = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    tree = {}
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            tree[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return tree
+
+
+def _input_pane_session_owner():
+    """입력 pane 프로세스가 이 cwd 에서 소유한 session_id.
+
+    반환 verdict: bound | ambiguous | unknown.
+    pane pid 가 active_sessions 에 있으면 그 세션이다. ps 가 죽어도 이 일치는 유지한다.
+    아니면 조상 8단계와 자손 64명 안에서 소유 세션이 정확히 하나일 때만 bound.
+    """
+    owners = _active_sessions_for_cwd()
+    pane_pid = _tmux_pane_pid()
+    if pane_pid and pane_pid in owners:
+        return {
+            "verdict": "bound",
+            "pid": pane_pid,
+            "session_id": owners[pane_pid],
+            "why": "입력 pane 의 pid 가 이 cwd 세션 소유와 같다",
+        }
+    if not pane_pid or not owners:
+        return {
+            "verdict": "unknown",
+            "pid": pane_pid or 0,
+            "session_id": "",
+            "why": "입력 pane 의 프로세스 소유를 정하지 못했다",
+        }
+    tree = _read_process_tree()
+    if not tree:
+        return {
+            "verdict": "unknown",
+            "pid": pane_pid,
+            "session_id": "",
+            "why": "프로세스 트리를 읽지 못해 다른 세션을 고르지 않는다",
+        }
+    found = []
+
+    def add(pid):
+        sid = owners.get(pid)
+        if sid and sid not in found:
+            found.append(sid)
+
+    cur = pane_pid
+    for _ in range(8):
+        parent = tree.get(cur) or 0
+        if not parent or parent == cur or parent <= 1:
+            break
+        add(parent)
+        cur = parent
+    children = {}
+    for pid, parent in tree.items():
+        children.setdefault(parent, []).append(pid)
+    queue = [pane_pid]
+    seen = {pane_pid}
+    while queue and len(seen) <= 64:
+        node = queue.pop(0)
+        for child in children.get(node, []):
+            if child in seen or len(seen) >= 64:
+                continue
+            seen.add(child)
+            queue.append(child)
+            add(child)
+    if len(found) == 1:
+        return {
+            "verdict": "bound",
+            "pid": pane_pid,
+            "session_id": found[0],
+            "why": "입력 pane 의 프로세스 트리에서 세션 소유가 하나다",
+        }
+    if len(found) > 1:
+        return {
+            "verdict": "ambiguous",
+            "pid": pane_pid,
+            "session_id": "",
+            "why": f"입력 pane 의 프로세스 트리에 세션 소유가 {len(found)}개다",
+        }
+    return {
+        "verdict": "unknown",
+        "pid": pane_pid,
+        "session_id": "",
+        "why": "입력 pane 의 프로세스 트리에 이 cwd 세션이 없다",
+    }
+
+
 def tui_session_rotation():
-    """핀한 세션과 실제로 살아 있는 세션이 갈렸는지 본다.
+    """입력 pane 의 세션 소유와 핀이 같은지 본다.
 
     반환 = dict(pin, pin_mtime, live, live_mtime, verdict, why)
-      verdict: "ok"        핀이 살아 있다 (또는 판정 불가)
-               "rotated"   갈렸고 추종 조건 4개를 모두 만족한다
-               "ambiguous" 갈린 것 같은데 후보가 여럿이라 안 따라간다
+      verdict: "ok"         핀이 그 프로세스의 세션이다. 또는 핀을 빼앗지 않는다.
+               "rotated"    같은 프로세스의 session_id 가 핀과 다르다.
+               "ambiguous"  소유 세션이 둘 이상이라 고르지 않는다.
+               "unknown"    소유 증거가 없다. 다른 세션을 임의로 고르지 않는다.
+    같은 cwd 의 최근 기록은 이유가 되지 않는다.
     """
     pin = tui_session_id()
-    root = _tui_sessions_root()
-    now = time.time()
     kind, pin_mtime = _history_stat(pin) if pin else ("missing", 0.0)
     out = {"pin": pin, "pin_mtime": pin_mtime, "pin_kind": kind,
            "live": "", "live_mtime": 0.0, "verdict": "ok", "why": ""}
@@ -969,46 +1088,32 @@ def tui_session_rotation():
         out["why"] = "핀한 대화의 일기장을 못 읽었다 — 없다고 단정하지 않는다"
         return out
     # 방금 켠 세션(폴더만 있고 첫 줄 전)을 죽었다고 보고 뺏지 않는다.
-    # ★0.0 을 살아있다고 뒤집지 않는다. missing 은 아래 후보 검색으로 내려간다.
     if kind == "empty":
         out["why"] = "핀한 대화가 아직 기록 중이다"
         return out
-    # ① 핀이 아직 살아 있으면 건드리지 않는다.
-    #    pin_mtime 이 0 인 ok 는 없다. 0 을 truthy 로 뒤집으면 missing 추종이 영영 안 돈다.
-    if kind == "ok" and pin_mtime and (now - pin_mtime) < TUI_FOLLOW_STALE_SEC:
-        out["why"] = "핀한 대화가 아직 기록 중이다"
-        return out
-
     try:
-        names = os.listdir(root)
-    except OSError as exc:
-        out["why"] = f"세션 폴더를 못 읽었다({exc})"
+        owner = _input_pane_session_owner()
+    except Exception as exc:  # noqa: BLE001
+        out["verdict"] = "unknown"
+        out["why"] = f"입력 pane 소유 판정 실패({exc}) — 다른 세션을 고르지 않는다"
         return out
-
-    cands = []
-    for name in names:
-        if name == pin:
-            continue
-        cand_kind, m = _history_stat(name)
-        if cand_kind != "ok":
-            continue
-        if m <= pin_mtime:                      # ② 핀보다 엄격히 최신만
-            continue
-        if (now - m) > TUI_FOLLOW_FRESH_SEC:    # ④ 최근에 쓰인 것만
-            continue
-        cands.append((m, name))
-
-    if not cands:
-        out["why"] = "핀보다 최신인 살아있는 후보가 없다"
+    if owner["verdict"] == "bound":
+        sid = owner["session_id"]
+        live_kind, live_mtime = _history_stat(sid)
+        out["live"] = sid
+        out["live_mtime"] = live_mtime if live_kind == "ok" else 0.0
+        if sid == pin:
+            out["why"] = owner["why"]
+            return out
+        out["verdict"] = "rotated"
+        out["why"] = owner["why"] + " — 핀을 그 세션으로 맞춘다"
         return out
-    cands.sort(reverse=True)
-    out["live"], out["live_mtime"] = cands[0][1], cands[0][0]
-    if len(cands) > 1:                          # ③ 하나일 때만
-        out["verdict"] = "ambiguous"
-        out["why"] = f"후보가 {len(cands)}개다 — 잘못된 대화를 집을 수 있어 안 따라간다"
-        return out
-    out["verdict"] = "rotated"
-    out["why"] = "핀한 대화는 죽었고 살아있는 후보가 정확히 하나다"
+    out["verdict"] = owner["verdict"] if owner["verdict"] in ("ambiguous", "unknown") else "unknown"
+    out["why"] = (
+        owner["why"]
+        + f" — 최근 {TUI_FOLLOW_FRESH_SEC}s 기록이나 {TUI_FOLLOW_STALE_SEC}s 정지로 "
+        "다른 세션을 고르지 않는다"
+    )
     return out
 
 
@@ -1924,6 +2029,10 @@ def harvest_orphaned_tui_finals(source="telegram", task_id=None):
     """
     if CHAT_LANE != "tui":
         return 0
+    try:
+        tui_follow_session_rotation()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 세션 추종 점검 실패: {exc}", file=sys.stderr)
     sid = (tui_session_id() or "").strip()
     if not sid:
         return 0
@@ -1963,6 +2072,10 @@ def harvest_orphaned_tui_finals(source="telegram", task_id=None):
 
 def _tui_wait_inflight_if_any():
     """기동 직후: 죽기 전 붙여넣은 턴의 답이 아직 안 왔으면 기다린다. 붙여넣기는 안 한다."""
+    try:
+        tui_follow_session_rotation()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 세션 추종 점검 실패: {exc}", file=sys.stderr)
     job = _tui_inflight_load()
     if not job:
         return
@@ -1975,8 +2088,14 @@ def _tui_wait_inflight_if_any():
         baseline = int(job.get("baseline") or 0)
     except (TypeError, ValueError):
         return
+    request_text = str(job.get("request_text") or "")
     try:
-        _tui_wait_for_final(tui_history_path(), baseline)
+        _tui_wait_for_final(
+            tui_history_path(),
+            baseline,
+            rescue_prompt=request_text,
+            request_text=request_text,
+        )
     except GrokExecError as exc:
         print(f"{TUI_LOG_KEY} inflight wait: {exc}", file=sys.stderr)
 
@@ -2178,9 +2297,9 @@ def _tui_paste(prompt, before_submit=None, *, confirm_submit=True, clear_compose
     payload = with_reply_style_instruction((prompt or "").rstrip("\n"))
     if not payload:
         raise GrokExecError("TUI 에 보낼 질문이 비어 있다")
-    # ★붙여넣기 직전에 「보는 일기장이 맞나」를 확인한다 (T-260824-028).
-    #   그록 TUI 가 도중 새 대화로 갈아탔으면 여기서 따라간다 — 조건 4개를 모두
-    #   만족할 때만이고, 모호하면 안 따라가고 진단만 남긴다(tui_session_rotation).
+    # ★붙여넣기 직전에 입력 pane 의 세션 소유와 핀을 맞춘다 (T-260824-028, T-261007-012).
+    #   같은 cwd 의 다른 프로세스가 더 최근에 기록해도 그 세션으로 옮기지 않는다.
+    #   소유가 없거나 둘 이상이면 핀을 두고 진단만 남긴다.
     #   발사 ★직전에 두는 이유 = 대기 루프가 열기 전에 맞춰야 그 턴이 회수된다.
     try:
         tui_follow_session_rotation()
@@ -2350,14 +2469,13 @@ def _tui_rescue_after_rotation(prompt, started_at):
 
     ★남의 답을 배달하지 않는다 = 두 겹으로 확인한 뒤에만 건진다.
       ① 살아있는 일기장이 ★이 잡이 시작된 뒤에 쓰였다 (그 전 기록이면 남의 턴이다)
-      ② 그 최종답 ★바로 앞의 질문이 내가 보낸 질문이다 (앞머리 대조)
+      ② 그 최종답 ★바로 앞의 질문이 내가 보낸 질문이다 (정규화된 원문 전체 일치)
       하나라도 어긋나면 건지지 않고 종전대로 실패를 올린다. ★핀 이동은 그래도 남는다 —
       다음 턴이 살아있는 대화를 보게 하는 것이 회수 실패보다 중요하다.
     """
     if not TUI_RESCUE_ON_ROTATION:
         return "", False
-    head = (prompt or "").strip()
-    needle = head.splitlines()[0].strip()[:TUI_RESCUE_MATCH_CHARS] if head else ""
+    expected = strip_reply_style_instruction((prompt or "").strip())
     rot = tui_session_rotation()
     if rot["verdict"] != "rotated":
         return "", False
@@ -2370,7 +2488,7 @@ def _tui_rescue_after_rotation(prompt, started_at):
         return "", False
     if not tui_follow_session_rotation():
         return "", False
-    if len(needle) < 4:
+    if not expected:
         return "", True
     try:
         rows = _read_history_rows(tui_history_path())
@@ -2382,11 +2500,11 @@ def _tui_rescue_after_rotation(prompt, started_at):
         return "", True
     pos = finals[-1]
     for back in range(pos - 1, -1, -1):
-        question = _tui_user_query_text(rows[back])
+        question = strip_reply_style_instruction(_tui_user_query_text(rows[back]))
         if not question:
             continue
         # ★가장 가까운 질문 ★하나만 본다. 더 뒤로 가면 옛 질문에 새 답을 붙인다.
-        if needle in question or question.strip()[: len(needle)] == needle:
+        if question == expected:
             print(f"{TUI_LOG_KEY} 갈린 대화에서 답 회수 (핀 이동 후)", file=sys.stderr)
             return str(rows[pos].get("content") or "").strip(), True
         print(
@@ -2422,15 +2540,19 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
     def _request_rows(rows):
         if not request_text:
             return rows
+        needle = request_text.strip()
+        last = None
         for idx, row in enumerate(rows):
-            if _tui_user_query_text(row) == request_text.strip():
-                following = rows[idx + 1:]
-                for stop, item in enumerate(following):
-                    if _tui_user_query_text(item):
-                        return following[:stop]
-                return following
-        # An older turn may finish between the busy insertion and its user row.
-        return []
+            if _tui_user_query_text(row) == needle:
+                last = idx
+        if last is None:
+            # An older turn may finish between the busy insertion and its user row.
+            return []
+        following = rows[last + 1:]
+        for stop, item in enumerate(following):
+            if _tui_user_query_text(item):
+                return following[:stop]
+        return following
 
     def _emit_progress():
         nonlocal last_emit, last_progress_line, progress_mode
@@ -2625,13 +2747,19 @@ def run_grok_tui(prompt, on_progress=None, source=None):
                 "baseline": baseline,
                 "source": source or _JOB_SOURCE or "telegram",
                 "preview": (prompt or "").strip().splitlines()[0][:80] if prompt else "",
+                "request_text": prompt or "",
             }
         )
 
     session_id, path, baseline = _tui_paste(prompt, before_submit=remember_submission)
     # rescue_prompt = 실패했을 때 「이 답이 ★내 질문의 답인가」를 대조할 원문 (T-260825-003).
+    # request_text = 이 질문이 적힌 구간만 성공이다. 다른 프로세스·이전 최종답은 제외한다.
     answer = _tui_wait_for_final(
-        path, baseline, on_progress=on_progress, rescue_prompt=prompt
+        path,
+        baseline,
+        on_progress=on_progress,
+        rescue_prompt=prompt,
+        request_text=prompt,
     )
     return answer, None, session_id
 
