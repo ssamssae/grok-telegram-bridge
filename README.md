@@ -8,6 +8,15 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it does not share runtime code with either.
 
+## New in 0.6.2
+
+When several Grok sessions share a working directory, Telegram replies now stay
+with the session connected to the bridge. Another session's answer no longer
+finishes your request or stops its typing indicator. Reply recovery also checks
+the whole question before returning an answer.
+
+See the [0.6.2 release notes](RELEASE_NOTES-0.6.2.md) for upgrade details.
+
 ## New in 0.6.0
 
 Send `/model` for model-selection buttons, or `/model <model-id>` to switch the
@@ -89,6 +98,9 @@ was sitting on the clipboard is no longer pasted into Grok just because you
 sent a text message.
 
 ## What You Need
+
+Billing classification for Grok CLI use is unverified. This bridge does not
+guarantee that CLI usage is covered by a subscription. Check your account's terms.
 
 - A computer where the `grok` CLI is installed and logged in. Linux, macOS, or
   WSL on Windows.
