@@ -50,3 +50,12 @@ roundtrip. This does not claim a live check on every public installation.
 
 GitHub Pages publishes `main:/docs` automatically. Merging this release also
 rebuilds the existing static guide; no bridge service runs in GitHub Pages.
+
+## Background task results (0.6.3)
+
+A completed human question followed by an earlier background task completion
+produces one labeled background result. It does not repeat the human question.
+Restart recovery retains that label; foreground waits and session-rotation
+recovery cannot accept the background result as a different question's answer.
+Run `python3 -m unittest discover -s tests -p "test_*.py"`. The regression fixture
+uses temporary histories and a captured sender, without changing a live session.

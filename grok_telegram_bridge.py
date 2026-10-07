@@ -1503,6 +1503,44 @@ def _tui_user_query_text(row):
     return ""
 
 
+def _tui_is_background_completion(row):
+    """A CLI task-completion notification starts its own non-human turn."""
+    if not isinstance(row, dict) or row.get("type") != "user" or _tui_user_query_text(row):
+        return False
+    content = row.get("content")
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        text = block.get("text") if isinstance(block, dict) else block
+        if isinstance(text, str) and re.match(
+            r'^\s*<system-reminder>\s*Background task\s+"[^"\n]+"\s+completed\b', text
+        ):
+            return True
+    return False
+
+
+def _tui_answer_origin(rows, position):
+    """Return the nearest request boundary without crossing a task completion."""
+    for index in range(position - 1, -1, -1):
+        question = _tui_user_query_text(rows[index])
+        if question:
+            return index, question, False
+        if _tui_is_background_completion(rows[index]):
+            return index, "", True
+    return -1, "", False
+
+
+def _tui_request_rows_after(rows, position):
+    following = rows[position + 1:]
+    for stop, row in enumerate(following):
+        if _tui_user_query_text(row) or _tui_is_background_completion(row):
+            return following[:stop]
+    return following
+
+
+def _tui_background_answer_text(text):
+    return "[" + "Background task result" + "]\n\n" + text
+
+
 def _tui_final_answer_indices(rows):
     """최종답이 몇 번째 행인지. 질문 짝을 뒤로 찾으려면 위치가 필요하다.
 
@@ -2057,12 +2095,15 @@ def harvest_orphaned_tui_finals(source="telegram", task_id=None):
         else:
             _tui_cursor_save(sid, len(finals))
             return 0
-    new_rows = finals[_tui_cursor_clamp(already, len(finals)) :]
+    new_indices = _tui_final_answer_indices(rows)[_tui_cursor_clamp(already, len(finals)) :]
     sent = 0
-    for row in new_rows:
-        text = str(row.get("content") or "").strip()
+    for position in new_indices:
+        text = str(rows[position].get("content") or "").strip()
         if not text:
             continue
+        _index, _question, background = _tui_answer_origin(rows, position)
+        if background:
+            text = _tui_background_answer_text(text)
         print(f"{TUI_LOG_KEY} orphaned final harvest", file=sys.stderr)
         mirror_answer(source, text, task_id=task_id)
         sent += 1
@@ -2499,6 +2540,8 @@ def _tui_rescue_after_rotation(prompt, started_at):
     if not finals:
         return "", True
     pos = finals[-1]
+    if _tui_answer_origin(rows, pos)[2]:
+        return "", True
     for back in range(pos - 1, -1, -1):
         question = strip_reply_style_instruction(_tui_user_query_text(rows[back]))
         if not question:
@@ -2550,7 +2593,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
             return []
         following = rows[last + 1:]
         for stop, item in enumerate(following):
-            if _tui_user_query_text(item):
+            if _tui_user_query_text(item) or _tui_is_background_completion(item):
                 return following[:stop]
         return following
 
@@ -3559,7 +3602,7 @@ def _observe_local_progress(sid, rows):
         return
     idx, question = questions[-1]
     key = (sid, idx, question)
-    fresh = rows[idx + 1:]
+    fresh = _tui_request_rows_after(rows, idx)
     complete = bool(_tui_final_answer_rows(fresh))
     failed = any(row.get("type") == "error" for row in fresh if isinstance(row, dict))
     if key != state["key"]:
@@ -3613,13 +3656,11 @@ def mirror_local_tui_turns():
         answer = str(rows[pos].get("content") or "").strip()
         if not answer:
             continue
-        question = ""
-        for back in range(pos - 1, -1, -1):
-            question = _tui_user_query_text(rows[back])
-            if question:
-                break
+        back, question, background = _tui_answer_origin(rows, pos)
         if question:
             _deliver_local_tui_prompt(question, (sid, back, question))
+        if background:
+            answer = _tui_background_answer_text(answer)
         print(f"{TUI_LOG_KEY} local mirror 배달", file=sys.stderr)
         mirror_answer(TUI_MIRROR_LOCAL_SOURCE, answer)
         sent += 1
