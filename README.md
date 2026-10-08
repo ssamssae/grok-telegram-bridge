@@ -8,6 +8,12 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it does not share runtime code with either.
 
+## New in 0.6.3
+
+Late background results are labeled separately. They no longer replay an
+unrelated question or finish that question's reply wait. See the
+[0.6.3 release notes](RELEASE_NOTES-0.6.3.md).
+
 ## New in 0.6.2
 
 When several Grok sessions share a working directory, Telegram replies now stay
