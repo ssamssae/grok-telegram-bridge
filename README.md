@@ -6,7 +6,7 @@ Text your own private Telegram bot, and the message runs as a Grok turn on your
 computer. Grok's finished answer comes back to your phone.
 
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
-the Codex Telegram Bridge, but it does not share runtime code with either.
+the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
 ## New in 0.6.3
 
@@ -30,8 +30,8 @@ connected Grok TUI session. The CLI supplies the available models. Changing a
 model also changes the CLI default. The bridge protects active work and drafts,
 and confirms a switch from session metadata. Headless switching is unsupported.
 
-Normal Telegram inputs also remind Grok not to append unsolicited suggested
-replies. Existing terminal output and direct terminal input are unaffected.
+Normal Telegram inputs receive no suggested-reply generation instructions or
+reply-style reminders. Existing terminal output and direct terminal input are unaffected.
 See [release notes](RELEASE_NOTES-0.6.0.md) for upgrade details.
 
 ## Read This First
@@ -307,3 +307,13 @@ session and let it be recreated.
 ## License
 
 MIT, matching the sibling bridges.
+
+## Interface language
+
+Use `/language en` or `/language ko` in your configured Telegram chat; `/language`
+shows the current setting. The selection persists after restart. Public installs
+default to English. Bridge instructions, notices and controls are localized;
+your prompts, AI answers, option text and model identifiers remain unchanged.
+
+For the initial setting, use `GRB_LANGUAGE=en` or `GRB_LANGUAGE=ko`.
+See [language settings and verification](docs/i18n.md) for precedence and coverage.

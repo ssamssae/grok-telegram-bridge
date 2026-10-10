@@ -59,3 +59,8 @@ Restart recovery retains that label; foreground waits and session-rotation
 recovery cannot accept the background result as a different question's answer.
 Run `python3 -m unittest discover -s tests -p "test_*.py"`. The regression fixture
 uses temporary histories and a captured sender, without changing a live session.
+
+## Release 0.6.4 verification
+
+Public export and regression suite: 30 tests (5 other-engine skips). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
