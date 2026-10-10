@@ -1,6 +1,6 @@
 # Grok Telegram Bridge
 
-[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/grok-telegram-bridge/) · [Web verification](docs/feature-map.md)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/grok-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
 Text your own private Telegram bot, and the message runs as a Grok turn on your
 computer. Grok's finished answer comes back to your phone.
