@@ -1,8 +1,9 @@
-# Grok Telegram Bridge — 한국어 사용 안내
+# Grok Telegram Bridge
 
-[English README](https://github.com/ssamssae/grok-telegram-bridge#readme) · [언어 전환 웹 설명서](https://product.kangdaejong.com/grok-telegram-bridge/?lang=ko)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/grok-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
-컴퓨터에서 브릿지를 실행하고, 본인 전용 텔레그램 봇에 요청을 보내 휴대전화로 결과를 받습니다.
+텔레그램의 본인 전용 봇으로 컴퓨터의 Grok에 메시지를 보내고 답변을 받습니다.
+브릿지 언어는 한국어·영어 중 고를 수 있습니다. AI 답변의 언어와 모델 설정은 별개입니다.
 
 ## 0.6.3 변경 사항
 
@@ -21,34 +22,59 @@
 
 ## 시작하기
 
-먼저 Grok CLI를 설치하고 로그인하세요. 운영체제와 터미널 준비 사항은 설치한 버전의 전체 README를 확인하세요.
-
-
-```sh
+```bash
 git clone https://github.com/ssamssae/grok-telegram-bridge.git
 cd grok-telegram-bridge
 cp config.example.env .env
 ```
 
-저장소를 내려받은 다음 README에 따라 토큰 파일, 본인 채팅 ID, CLI 연결을 설정한 뒤 브릿지를 실행하세요.
+BotFather에서 본인 전용 봇을 만들고, 안내받은 토큰을 로컬 토큰 파일에 저장하세요.
+파일 형식은 `{"api_key": "본인 봇 토큰"}`입니다. 이 파일과 `.env`는 공개 저장소나 채팅에 올리지 마세요.
+토큰 파일 경로와 본인 채팅 ID를 `.env`의 `GRB_TOKEN_FILE`, `GRB_CHAT_ID`에 지정합니다.
+본인 채팅 ID 확인 절차는 [영문 설치 안내](README.md)를 참고하세요.
 
-공식 [@BotFather](https://t.me/BotFather)에 `/newbot`을 보내 본인 전용 봇을 만드세요.
-토큰은 로컬 설정 도구나 비공개 설정 파일에만 입력하고, 설정 안내에 따라 새 봇에 `/start`를 보냅니다.
+```bash
+set -a
+source .env
+set +a
+python3 grok_telegram_bridge.py
+```
 
-현재 프로젝트를 설명해 달라는 작은 요청부터 보내세요. 연결된 터미널과 텔레그램 답변을 확인합니다. CLI의 기존 권한과 승인 규칙이 그대로 적용됩니다.
+`Grok` CLI 설치·로그인과 기존 터미널 세션 연결은 [영문 설치 안내](README.md)를 따릅니다.
+공개 실행 파일과 같은 폴더의 공통 Python 파일들도 함께 설치해야 합니다.
 
-## 언어 설정
+## 언어와 기본 사용
 
-웹 설명서 상단에서 한국어 또는 English를 선택하면 페이지 전체가 즉시 바뀌고 브라우저에 선택이 저장됩니다.
-언어 설정을 지원하는 브릿지 버전에서는 봇에 `/language ko`, `/language en`, `/language`를 보냅니다.
-명령이 없는 버전은 설치 버전의 README와 릴리스 노트에서 지원 여부를 확인하세요.
+봇 대화에서 다음 명령을 보냅니다.
 
-웹 설명서와 브릿지 언어는 각각 선택합니다. 요청, AI 답변, 코드, 질문 선택지를 번역하거나 모델·계정을 바꾸지는 않습니다. 답변 언어는 AI에게 직접 요청하세요.
+```text
+/language ko
+/language en
+/language
+/ping
+```
 
-## 문제 해결
+- `/language ko`: 브릿지 안내와 버튼을 한국어로 표시합니다.
+- `/language en`: 영어로 표시합니다.
+- `/language`: 현재 선택을 확인합니다.
+- `/ping`: 브릿지 연결 응답을 확인합니다.
 
-CLI 로그인, 브릿지 실행 상태, 본인 봇 대화의 채팅 ID 설정을 확인하세요. 연결 설정을 바꾸기 전에 README의 진단 절차를 따르세요.
+언어 명령은 브릿지가 처리하며 Grok 입력으로 보내지 않습니다. 선택은 재시작 후에도 유지됩니다.
+그다음 평소처럼 요청을 보내면 연결된 Grok 세션에서 처리하고 완료된 답변을 전달합니다.
+승인·선택 카드의 안내는 선택한 언어로 보이고, 질문·선택지·모델 이름·코드는 원문을 유지합니다.
 
-비공개 브라우징이나 브라우저 저장소 차단 상태에서는 웹 언어가 저장되지 않을 수 있습니다. 현재 페이지의 언어 선택은 사용할 수 있고, 공유 링크에는 ?lang=ko 또는 ?lang=en을 붙이면 됩니다.
+## 설정과 문제 확인
 
-[전체 설치·진단 안내](https://github.com/ssamssae/grok-telegram-bridge#readme) · [릴리스 노트](https://github.com/ssamssae/grok-telegram-bridge/releases)
+처음 사용할 언어는 `.env` 또는 서비스 설정의 `GRB_LANGUAGE=ko`로 지정할 수 있습니다.
+이미 대화에서 고른 언어가 있으면 그 선택을 우선합니다. 설정을 바꾸려면 `/language`를 사용하세요.
+여러 브릿지를 같은 컴퓨터에서 쓰더라도 언어 선택 파일은 브릿지별로 구분됩니다.
+
+응답이 없으면 프로세스 실행 여부, 본인 채팅 ID, 토큰 파일 경로와 연결한 터미널 세션을 확인하세요.
+로그를 공유할 때는 토큰과 대화 내용을 제거하세요. 언어 파일 저장에 실패하면 오류를 알리고 기존 언어를 유지합니다.
+
+## 지원 범위
+
+연결·전달·오류 안내, 승인·선택 카드 설명, 복구·확인 버튼과 주요 설정 응답을 번역합니다.
+AI 답변과 사용자 입력을 번역 서비스로 보내지 않으며 별도 번역 비용이 없습니다.
+터미널 설치·진단 출력, 고급 운영 보고와 CLI가 직접 만든 문구는 기존 언어를 유지합니다.
+자세한 검증 경로는 [언어 설정 문서](docs/i18n.md), 고급 설정은 [영문 문서](README.md)에 있습니다.

@@ -42,7 +42,7 @@ class ModelControlsTest(unittest.TestCase):
     def test_reply_style_is_idempotent_and_preserves_commands(self):
         b = self.bridge
         text = b.with_reply_style_instruction('Hello')
-        self.assertTrue(text.endswith(b.REPLY_STYLE_INSTRUCTION))
+        self.assertEqual(text, 'Hello')
         self.assertEqual(b.with_reply_style_instruction(text), text)
         self.assertEqual(b.strip_reply_style_instruction(text), 'Hello')
         self.assertEqual(b.with_reply_style_instruction('/model grok-4.7'), '/model grok-4.7')

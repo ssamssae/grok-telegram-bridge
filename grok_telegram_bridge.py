@@ -10,6 +10,7 @@ session uuid mapping is kept in a local state file instead of reusing a
 human-readable key.
 """
 import contextlib
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -61,6 +62,23 @@ TOKEN_FILE = env("GRB_TOKEN_FILE")
 # No default on purpose: a shipped chat id would hand strangers this machine.
 CHAT_ID = env("GRB_CHAT_ID", "") or ""
 STATE_DIR = env("GRB_STATE_DIR", os.path.join(HOME, ".grok-telegram-bridge", "state"))
+from bridge_i18n import Language  # noqa: E402
+from pathlib import Path
+LANGUAGE = Language(Path(STATE_DIR).expanduser(), default="en", env_prefix="GRB", state_name="grok-bridge-language.json")
+
+
+def tr(source, **values):
+    return LANGUAGE.text(source, **values)
+
+
+def consume_language_command(text):
+    reply = LANGUAGE.command(text or "")
+    if reply is None:
+        return False
+    deliver_mesh_event("report", reply)
+    return True
+
+
 NAME = env("GRB_NAME", "grok")
 GROK_BIN = env("GRB_GROK_BIN", "grok")
 
@@ -146,6 +164,8 @@ INBOX_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.inbox.jsonl")
 # T-260823-051: 재기동 뒤 TUI 최종답 회수. 커서는 「이미 폰으로 보낸 최종답 개수」.
 TUI_CURSOR_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.tui-cursor.json")
 TUI_INFLIGHT_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.tui-inflight.json")
+PUBLIC_PROGRESS_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.public-progress.json")
+_PUBLIC_PROGRESS_LOCK = threading.RLock()
 _JOB_SOURCE = "telegram"
 # 폰발 턴이 도는 동안 로컬 미러는 비켜선다 (T-260824-036). GROK_LOCK 만으로는 못 막는
 # 창이 있다 — process_job 은 락을 놓은 뒤에 mirror_answer 로 커서를 올리고, 그 사이를
@@ -1364,8 +1384,8 @@ def notify_tui_cleared(task_id=None):
 
     (실사고: 폰 /clear 확인이 부엉이만 큼직하게 찍힘, T-260823-025).
     """
-    local_print(TUI_CLEAR_CONFIRM)
-    deliver_mesh_event("final", TUI_CLEAR_CONFIRM, task_id=task_id)
+    local_print(tr(TUI_CLEAR_CONFIRM))
+    deliver_mesh_event("final", tr(TUI_CLEAR_CONFIRM), task_id=task_id)
 
 
 def _active_sessions_for_cwd():
@@ -1455,6 +1475,81 @@ def _read_history_rows(path):
     return rows
 
 
+def _grok_public_assistant(row, session_id=""):
+    if not isinstance(row, dict):
+        return False
+    if row.get("type") != "assistant":
+        return False
+    if row.get("role") not in (None, "assistant"):
+        return False
+    if any(row.get(key) for key in ("isSidechain", "is_sidechain", "isMeta", "is_meta",
+                                   "parent_tool_use_id", "subagent_id", "synthetic_reason",
+                                   "partial", "is_partial", "isPartial")):
+        return False
+    if row.get("channel") not in (None, "", "commentary", "final"):
+        return False
+    if session_id and row.get("session_id") not in (None, "", session_id):
+        return False
+    return True
+
+
+def _tui_public_progress_text(row, session_id=""):
+    if not _grok_public_assistant(row, session_id):
+        return ""
+    if row.get("channel") == "final":
+        return ""
+    if not row.get("tool_calls") and row.get("channel") != "commentary":
+        return ""
+    content = row.get("content")
+    return content if isinstance(content, str) else ""
+
+
+class _GrokPublicProgress:
+    """Receipt-backed dedup; callers hold later cards and the final on a failed send."""
+
+    def __init__(self, scope, task_id=None, session_id=""):
+        self.scope = str(scope)
+        self.task_id = task_id
+        self.session_id = session_id
+        self.sent = set()
+
+    def send(self, raw):
+        # Raw thinking/tool payloads never reach this adapter. Remove citation metadata
+        # and mask secrets before the shared short-card formatter.
+        raw = re.sub(r"<oai-mem-citation>.*?</oai-mem-citation>", "", raw, flags=re.S)
+        raw = re.sub(r"<oai-mem-citation>.*$", "", raw, flags=re.S)
+        safe = _turn_mirror.mask_secrets(raw).strip()
+        text = _flow_progress.public_progress_text(safe)
+        if not text:
+            return True
+        key = hashlib.sha256((self.scope + "\0" + safe).encode("utf-8")).hexdigest()
+        with _PUBLIC_PROGRESS_LOCK:
+            saved = _tui_json_load(PUBLIC_PROGRESS_FILE)
+            sent = saved.get("sent", [])
+            if not isinstance(sent, list):
+                sent = []
+            if key in self.sent or key in sent:
+                return True
+            try:
+                result = deliver_mesh_event("report", text, task_id=self.task_id, request_progress=True)
+            except Exception as exc:  # leave the row pending, without exposing its body
+                print(f"{TUI_LOG_KEY} 공개 진행 발신 실패: {type(exc).__name__}", file=sys.stderr)
+                return False
+            if not _first_sent_message_id(result):
+                return False
+            self.sent.add(key)
+            saved["sent"] = (sent + [key])[-512:]
+            _tui_json_save(PUBLIC_PROGRESS_FILE, saved)
+            return True
+
+    def flush(self, rows):
+        for row in rows:
+            text = _tui_public_progress_text(row, self.session_id)
+            if text and not self.send(text):
+                return False
+        return True
+
+
 def _tui_final_answer_rows(rows):
     """최종답변 꼴 = assistant + content 가 비지 않은 문자열 + tool_calls 없음.
 
@@ -1464,7 +1559,7 @@ def _tui_final_answer_rows(rows):
     """
     finals = []
     for row in rows:
-        if not isinstance(row, dict) or row.get("type") != "assistant":
+        if not _grok_public_assistant(row) or row.get("channel") == "commentary":
             continue
         if row.get("tool_calls"):
             continue
@@ -1538,7 +1633,7 @@ def _tui_request_rows_after(rows, position):
 
 
 def _tui_background_answer_text(text):
-    return "[" + "Background task result" + "]\n\n" + text
+    return "[" + tr("백그라운드 작업 결과") + "]\n\n" + text
 
 
 def _tui_final_answer_indices(rows):
@@ -1859,8 +1954,8 @@ def _tui_stall_alert_line(detail, seconds):
     stage = _tui_progress_line([detail]).removeprefix("아직 하고 있어. 지금은 ").rstrip(".")
     age = _tui_elapsed_words(seconds).replace(" 0초", "").replace(" 0분", "")
     return (
-        f"박힌 듯 — {stage} 이 {age}째야. 끊으려면 그록 창에서 Esc. "
-        "자동으로는 안 끊을게."
+        _flow_progress.recovery_notice("stalled", tr=tr)
+        + f"\n{stage} · {age}"
     )
 
 
@@ -1906,8 +2001,8 @@ def _tui_progress_done_line(elapsed, ok=True, reset=False, reason=None):
     if not ok:
         label = _tui_failure_reason_label(reason)
         if label:
-            return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에 — {label}"
-        return f"여기서 멈췄어 · {_tui_elapsed_words(elapsed)} 만에"
+            return _flow_progress.recovery_notice("failed", tr=tr) + f"\n{label}"
+        return _flow_progress.recovery_notice("failed", tr=tr)
     return f"응답 종료 · {_tui_elapsed_words(elapsed)} 걸림"
 
 
@@ -2075,6 +2170,7 @@ def harvest_orphaned_tui_finals(source="telegram", task_id=None):
     if not sid:
         return 0
     rows = _read_history_rows(tui_history_path())
+    _prepare_local_public_progress(sid, rows)
     finals = _tui_final_answer_rows(rows)
     cur = _tui_cursor_load()
     already = None
@@ -2095,13 +2191,17 @@ def harvest_orphaned_tui_finals(source="telegram", task_id=None):
         else:
             _tui_cursor_save(sid, len(finals))
             return 0
-    new_indices = _tui_final_answer_indices(rows)[_tui_cursor_clamp(already, len(finals)) :]
+    already = _tui_cursor_clamp(already, len(finals))
+    new_indices = _tui_final_answer_indices(rows)[already:]
     sent = 0
-    for position in new_indices:
+    for final_number, position in enumerate(new_indices, start=already):
         text = str(rows[position].get("content") or "").strip()
         if not text:
             continue
         _index, _question, background = _tui_answer_origin(rows, position)
+        if not _flush_local_public_progress(sid, rows[:position + 1], _index, _question):
+            _tui_cursor_save(sid, final_number)
+            return sent
         if background:
             text = _tui_background_answer_text(text)
         print(f"{TUI_LOG_KEY} orphaned final harvest", file=sys.stderr)
@@ -2312,12 +2412,7 @@ REPLY_STYLE_INSTRUCTION = (
 
 
 def with_reply_style_instruction(text):
-    raw = text or ""
-    if not raw.strip() or raw.lstrip().startswith("/") or is_dispatch_prompt(raw):
-        return raw
-    if raw.endswith(REPLY_STYLE_INSTRUCTION):
-        return raw
-    return raw + "\n\n" + REPLY_STYLE_INSTRUCTION
+    return strip_reply_style_instruction(text or "")
 
 
 def strip_reply_style_instruction(text):
@@ -2432,7 +2527,7 @@ def maybe_busy_inject_telegram(text, source):
     try:
         deliver_mesh_event(
             "ack",
-            "지금 하던 일에 바로 넣었어. 돌던 작업은 끊을게.",
+            tr('지금 하던 일에 바로 넣었어. 돌던 작업은 끊을게.'),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"{TUI_LOG_KEY} busy 삽입 ack 실패: {exc}", file=sys.stderr)
@@ -2579,6 +2674,10 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
     # on_progress 가 돌려주는 배달 모드. "anchor" = 말풍선 1통을 고쳐 쓰는 중,
     #   "message" = 새 말풍선 경로(앵커 실패·기능 OFF), "" = 아직 한 통도 안 보냄.
     progress_mode = ""
+    task_id = getattr(getattr(on_progress, "__self__", None), "task_id", None)
+    session_id = os.path.basename(os.path.dirname(path)) if os.path.basename(path) == "chat_history.jsonl" else ""
+    public_progress = _GrokPublicProgress(f"{path}:{baseline}:{request_text.strip()}",
+                                          task_id=task_id, session_id=session_id)
 
     def _request_rows(rows):
         if not request_text:
@@ -2623,6 +2722,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
             raise GrokExecError("/clear 로 레인을 되세웠다")
         rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
         fresh = _request_rows(rows[baseline:])
+        public_delivered = public_progress.flush(fresh)
         # ★진전 신호 = 히스토리 행 증가. reasoning·tool_call·tool_result 전부 포함한다
         #   (최종답변 행만 세면 도구를 오래 쓰는 턴이 「무진전」으로 잘린다 — 그게 원 증상이다).
         #   이미 매 폴에서 읽던 값이라 추가 비용 0.
@@ -2646,6 +2746,9 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
                 stall_first_seen.pop(call_id, None)
         finals = _tui_final_answer_rows(fresh)
         if finals:
+            if not public_delivered:
+                time.sleep(TUI_POLL_INTERVAL)
+                continue
             return str(finals[-1].get("content") or "").strip()
         now = time.time()
         if TUI_STALL_ALERT_SEC:
@@ -2657,14 +2760,14 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
                 stall_alerted.add(call_id)
                 try:
                     alert = _tui_stall_alert_line(detail, now - stall_first_seen[call_id])
-                    if on_progress:
+                    if on_progress and public_delivered:
                         on_progress(alert)
-                    else:
+                    elif public_delivered:
                         deliver_mesh_event("report", alert)
                 except Exception as exc:  # noqa: BLE001
                     print(f"{TUI_LOG_KEY} 박힘 경보 발신 실패: {exc}", file=sys.stderr)
         stage_changed = _tui_progress_line(reported) != last_progress_line
-        if on_progress and (now - last_emit >= _progress_interval() or
+        if public_delivered and on_progress and (now - last_emit >= _progress_interval() or
                             (stage_changed and now - last_emit >= 2)):
             _emit_progress()
         # ★조용한 실패가 제일 나쁘다 — 왜 잘렸는지를 문구로 가른다. 사용자 폰에 그대로 뜬다.
@@ -2690,7 +2793,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
             # ★last_history 는 여기서 안 건드린다 (T-260831-013). 소프트 idle 연장이
             #   하드 상한의 시계를 리셋하면 상수가 있어도 2시간 인질이 재발한다.
             last_progress = now
-            if not _tui_tool_in_flight(fresh) and reported:
+            if public_delivered and not _tui_tool_in_flight(fresh) and reported:
                 _emit_progress()
         if now - last_history >= TUI_IDLE_HARD_TIMEOUT:
             stop_reason = (
@@ -2723,6 +2826,7 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
                 raise GrokExecError("/clear 로 레인을 되세웠다")
             rows, baseline = _tui_rebaseline_if_compacted(path, baseline)
             fresh = _request_rows(rows[baseline:])
+            public_delivered = public_progress.flush(fresh)
             if follow and (
                 len(fresh) > seen_harvest or _tui_tool_in_flight(fresh)
             ):
@@ -2730,13 +2834,17 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
                 harvest_until = time.time() + TUI_LATE_HARVEST_GRACE
             finals = _tui_final_answer_rows(fresh)
             if finals:
+                if not public_delivered:
+                    harvest_until = time.time() + TUI_LATE_HARVEST_GRACE
+                    time.sleep(TUI_POLL_INTERVAL)
+                    continue
                 print(
                     f"{TUI_LOG_KEY} 늦은 회수 ({stop_reason})",
                     file=sys.stderr,
                 )
                 return str(finals[-1].get("content") or "").strip()
             now = time.time()
-            if on_progress and now - last_emit >= _progress_interval():
+            if public_delivered and on_progress and now - last_emit >= _progress_interval():
                 _emit_progress()
             time.sleep(TUI_POLL_INTERVAL)
 
@@ -2920,7 +3028,7 @@ def suggested_confirm_markup(cid):
     return json.dumps(
         {
             "inline_keyboard": [
-                [{"text": SUGGESTED_BUTTON_TEXT, "callback_data": f"{SUGGESTED_CALLBACK_PREFIX}:{cid}"}]
+                [{"text": tr(SUGGESTED_BUTTON_TEXT), "callback_data": f"{SUGGESTED_CALLBACK_PREFIX}:{cid}"}]
             ]
         },
         ensure_ascii=False,
@@ -2988,18 +3096,148 @@ def current_tui_model():
         return ""
 
 
-def model_composer_empty():
-    """Only the observed boxed, empty Grok composer permits a control command."""
-    proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+_ANSI_CSI_RE = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+
+
+def _strip_ansi(text):
+    return _ANSI_CSI_RE.sub("", text or "")
+
+
+def _sgr_italic(params, italic):
+    """SGR 3은 제안 문구(ghost)다. 38;2/48;2 색은 기울임이 아니다."""
+    codes = []
+    for part in (params or "0").split(";"):
+        if part == "":
+            codes.append(0)
+            continue
+        try:
+            codes.append(int(part))
+        except ValueError:
+            return italic
+    index = 0
+    while index < len(codes):
+        code = codes[index]
+        if code == 0:
+            italic = False
+        elif code == 3:
+            italic = True
+        elif code == 23:
+            italic = False
+        elif code in (38, 48) and index + 1 < len(codes):
+            mode = codes[index + 1]
+            if mode == 2 and index + 4 < len(codes):
+                index += 4
+            elif mode == 5 and index + 2 < len(codes):
+                index += 2
+        index += 1
+    return italic
+
+
+def _composer_parts(raw_line):
+    """Composer box → (typed text, italic suggestion). Not a box → None."""
+    if not re.match(r"\s*│\s*❯", _strip_ansi(raw_line)):
+        return None
+    italic = False
+    started = False
+    typed = []
+    ghost = []
+    index = 0
+    while index < len(raw_line):
+        if raw_line.startswith("\x1b[", index):
+            match = _ANSI_CSI_RE.match(raw_line, index)
+            if not match:
+                index += 1
+                continue
+            if match.group(2) == "m":
+                italic = _sgr_italic(match.group(1), italic)
+            index = match.end()
+            continue
+        char = raw_line[index]
+        index += 1
+        if not started:
+            if char == "❯":
+                started = True
+            continue
+        if char == "│":
+            break
+        (ghost if italic else typed).append(char)
+    return ("".join(typed).strip(), "".join(ghost).strip())
+
+
+# macOS 노드 2026-09-23 실캡처 때의 grok. 버전이 달라지면 입력칸을 다시 찍어 이 값을 갱신한다.
+SUGGESTION_CAPTURE_GROK_VERSION = "1.0.41"
+
+
+def _footer_accepts_suggestion(lines, box_index):
+    """입력칸 아래 바닥에 accept suggestion 이 있으면 그 글은 아직 수락 전 제안이다."""
+    footer = "\n".join(_strip_ansi(line) for line in lines[box_index + 1 :])
+    return "accept suggestion" in footer
+
+
+def model_composer_state():
+    """empty | ghost | draft | unknown.
+
+    제안은 기울임(SGR 3)이거나, 기울임이 빠져도 바닥이 accept suggestion 이면 제안이다.
+    사람이 친 글과 기울임 제안이 같이 있으면 초안이다. `-e` 없는 캡처는 제안을
+    초안으로 본다 (macOS 노드 2026-09-23).
+    """
+    proc = _tmux("capture-pane", "-e", "-p", "-J", "-t", TMUX_PANE)
     if proc.returncode:
-        return False
+        return "unknown"
     lines = (proc.stdout or "").splitlines()
     for index in range(len(lines) - 1, -1, -1):
-        if re.match(r"\s*│\s*❯", lines[index]):
-            return bool(re.fullmatch(r"\s*│\s*❯\s*│\s*", lines[index])) and (
-                index + 1 < len(lines) and lines[index + 1].lstrip().startswith("╰")
-            )
-    return False
+        parts = _composer_parts(lines[index])
+        if parts is None:
+            continue
+        nxt = _strip_ansi(lines[index + 1]) if index + 1 < len(lines) else ""
+        if not nxt.lstrip().startswith("╰"):
+            return "unknown"
+        typed, ghost = parts
+        accepts = _footer_accepts_suggestion(lines, index)
+        if typed and ghost:
+            return "draft"
+        if typed and not accepts:
+            return "draft"
+        if ghost or accepts:
+            return "ghost"
+        return "empty"
+    return "unknown"
+
+
+def model_composer_empty():
+    """제어 명령을 넣어도 되는 칸. 제안만 있는 칸은 비어 있다."""
+    return model_composer_state() in ("empty", "ghost")
+
+
+def control_dismiss_suggestion():
+    """Caller holds GROK_LOCK and has verified an idle session. No draft clear."""
+    if model_composer_state() != 'ghost':
+        return
+    _tmux('send-keys', '-t', TMUX_PANE, 'Escape')
+    time.sleep(TUI_SUBMIT_DELAY)
+
+
+def suggestion_fixture_version_note():
+    """설치된 grok이 표본 버전과 다르면 한 줄. 모델 변경 자체는 막지 않는다."""
+    try:
+        proc = subprocess.run(
+            [GROK_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+            env=grok_child_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    text = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if SUGGESTION_CAPTURE_GROK_VERSION in text:
+        return ""
+    shown = text.replace("\n", " ")[:80] or "미확인"
+    return (
+        f"grok-bridge[{NAME}] 제안 표본은 grok {SUGGESTION_CAPTURE_GROK_VERSION} 화면이다. "
+        f"지금 버전은 {shown}. 입력칸 제안을 다시 찍어 표본을 갱신하세요."
+    )
 
 
 def handle_model_command(text):
@@ -3013,52 +3251,59 @@ def handle_model_command(text):
         rows = [[{"text": ("✓ " if model == current else "") + model,
                   "callback_data": MODEL_CALLBACK_PREFIX + model}]
                 for model in models if len((MODEL_CALLBACK_PREFIX + model).encode()) <= 64]
-        msg = (f"현재 세션 모델: {current or '미확인'}\n"
-               "모델을 선택하세요. CLI 기본 모델도 함께 변경됩니다.\n"
-               "직접 입력: /model <모델 ID>\n" + "\n".join(models))
+        msg = tr('현재 세션 모델: {current}\n모델을 선택하세요. CLI 기본 모델도 함께 변경됩니다.\n직접 입력: /model <모델 ID>\n{models}', current=current or tr("미확인"), models="\n".join(models))
         deliver_mesh_event("copy_content", msg, reply_markup=json.dumps({"inline_keyboard": rows}))
     except (GrokExecError, OSError, subprocess.SubprocessError):
-        deliver_mesh_event("copy_content", "모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.")
+        deliver_mesh_event("copy_content", tr('모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.'))
 
 
 def apply_model_choice(model):
     """Model control has no assistant turn/history answer; verify CLI metadata instead."""
     if is_awaiting_human():
-        deliver_mesh_event("copy_content", "클리어 뒤 대기 중입니다. 먼저 대화를 재개하세요.")
+        deliver_mesh_event("copy_content", tr('클리어 뒤 대기 중입니다. 먼저 대화를 재개하세요.'))
         return
     if CHAT_LANE != "tui":
-        deliver_mesh_event("copy_content", "모델 변경은 연결된 Grok TUI 세션에서 지원합니다.")
+        deliver_mesh_event("copy_content", tr('모델 변경은 연결된 Grok TUI 세션에서 지원합니다.'))
         return
     try:
         if model not in available_models():
-            deliver_mesh_event("copy_content", "선택할 수 없는 모델입니다. /model 목록을 다시 확인하세요.")
+            deliver_mesh_event("copy_content", tr('선택할 수 없는 모델입니다. /model 목록을 다시 확인하세요.'))
             return
     except (GrokExecError, OSError, subprocess.SubprocessError):
-        deliver_mesh_event("copy_content", "모델 목록 조회 실패로 변경하지 않았습니다.")
+        deliver_mesh_event("copy_content", tr('모델 목록 조회 실패로 변경하지 않았습니다.'))
         return
     if _TUI_JOB_ACTIVE.is_set() or not JOBS.empty() or not GROK_LOCK.acquire(blocking=False):
-        deliver_mesh_event("copy_content", "작업 중입니다. 끝난 뒤 모델을 선택하세요.")
+        deliver_mesh_event("copy_content", tr('작업 중입니다. 끝난 뒤 모델을 선택하세요.'))
         return
     try:
-        if not tui_session_alive() or not _tui_repl_idle_probe() or not model_composer_empty():
-            deliver_mesh_event("copy_content", "터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.")
+        if not tui_session_alive() or not _tui_repl_idle_probe():
+            deliver_mesh_event("copy_content", tr('터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.'))
+            return
+        # Esc 한 번만. 두 번은 빈 칸에서 rewind 를 연다 (T-260823-046 와 같은 이유).
+        state = model_composer_state()
+        if state == "ghost":
+            _tmux("send-keys", "-t", TMUX_PANE, "Escape")
+            time.sleep(TUI_SUBMIT_DELAY)
+            state = model_composer_state()
+        if state != "empty":
+            deliver_mesh_event("copy_content", tr('터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.'))
             return
         tui_follow_session_rotation()
         if current_tui_model() == model:
-            deliver_mesh_event("copy_content", f"현재 세션은 이미 {model}입니다.")
+            deliver_mesh_event("copy_content", tr('현재 세션은 이미 {v0}입니다.', v0=model))
             return
         _tui_paste(f"/model {model}", confirm_submit=False, clear_composer=False)
         deadline = time.monotonic() + MODEL_VERIFY_TIMEOUT
         while True:
             if current_tui_model() == model:
-                deliver_mesh_event("copy_content", f"모델 변경 확인: {model}\nCLI 기본 모델도 함께 변경됩니다.")
+                deliver_mesh_event("copy_content", tr('모델 변경 확인: {v0}\nCLI 기본 모델도 함께 변경됩니다.', v0=model))
                 return
             if time.monotonic() >= deadline:
-                deliver_mesh_event("copy_content", "모델 변경 결과 미확인. 자동 재전송하지 않았습니다. /model로 현재 상태를 확인하세요.")
+                deliver_mesh_event("copy_content", tr('모델 변경 결과 미확인. 자동 재전송하지 않았습니다. /model로 현재 상태를 확인하세요.'))
                 return
             time.sleep(0.1)
     except (GrokExecError, OSError, subprocess.SubprocessError):
-        deliver_mesh_event("copy_content", "모델 변경 결과 미확인. 터미널 상태를 확인하세요.")
+        deliver_mesh_event("copy_content", tr('모델 변경 결과 미확인. 터미널 상태를 확인하세요.'))
     finally:
         GROK_LOCK.release()
 
@@ -3079,10 +3324,10 @@ def handle_telegram_callback(callback):
         tg("answerCallbackQuery", timeout=10, **params)
 
     if str(chat.get("id")) != str(CHAT_ID):
-        answer("이 채팅의 버튼이 아니야")
+        answer(tr('이 채팅의 버튼이 아니야'))
         return
     if is_awaiting_human():
-        answer("클리어 뒤라 이전 버튼은 안 먹어")
+        answer(tr('클리어 뒤라 이전 버튼은 안 먹어'))
         return
     data = str(cb.get("data") or "")
     if data.startswith(MODEL_CALLBACK_PREFIX):
@@ -3090,12 +3335,12 @@ def handle_telegram_callback(callback):
         apply_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
         return
     if not SUGGESTED_REPLY_CONFIRM:
-        answer("확인 버튼이 꺼져 있습니다.")
+        answer(tr('확인 버튼이 꺼져 있습니다.'))
         return
     data = str(cb.get("data") or "")
     prefix = f"{SUGGESTED_CALLBACK_PREFIX}:"
     if not data.startswith(prefix):
-        answer("알 수 없는 버튼이야")
+        answer(tr('알 수 없는 버튼이야'))
         return
     if data == SUGGESTED_DONE_CALLBACK:
         answer()
@@ -3202,8 +3447,13 @@ def _first_sent_message_id(mesh_result, surface=SEND_SURFACE):
     for delivery in (mesh_result or {}).get("deliveries", []):
         if delivery.get("surface") == surface and delivery.get("result") == "sent":
             mid = delivery.get("message_id")
-            if mid:
-                return mid
+            if isinstance(mid, bool):
+                continue
+            try:
+                if int(mid) > 0:
+                    return mid
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -3539,6 +3789,7 @@ class _GrokProgressAnchor:
 
 
 _TUI_LOCAL_PROGRESS = {"session": None, "observed": 0, "key": None, "anchor": None}
+_TUI_LOCAL_PUBLIC_PROGRESS = {"session": None, "observed": 0, "baseline": 0, "senders": {}}
 # T-260914-005: 같은 터미널 질문을 진행 중·최종답에서 두 번 보내지 않는다.
 _LOCAL_TUI_PROMPTS_SENT = set()
 
@@ -3560,7 +3811,9 @@ def _deliver_local_tui_prompt(question, key):
         return False
     kind = "report" if is_dispatch_prompt(question) else "final"
     # Approved directives belong to the user request, not background status spam.
-    deliver_mesh_event(kind, prompt, request_progress=(kind == "report"))
+    result = deliver_mesh_event(kind, prompt, request_progress=(kind == "report"))
+    if not _first_sent_message_id(result):
+        return False
     _LOCAL_TUI_PROMPTS_SENT.add(key)
     print(f"{TUI_LOG_KEY} local prompt 즉시 배달", file=sys.stderr)
     return True
@@ -3579,6 +3832,13 @@ def _mark_phone_progress_observed(request_text=""):
         if not matches:
             return
         observed = matches[-1] + 1
+    public_state = _TUI_LOCAL_PUBLIC_PROGRESS
+    if public_state["session"] != sid:
+        public_state.update(session=sid, observed=len(rows), baseline=observed, senders={})
+    else:
+        public_state["baseline"] = max(public_state["baseline"], observed)
+    public_state["observed"] = len(rows)
+    _save_local_public_progress(public_state)
     state = _TUI_LOCAL_PROGRESS
     if state["session"] != sid:
         _close_local_progress()
@@ -3627,6 +3887,65 @@ def _observe_local_progress(sid, rows):
         anchor.stage = stage
 
 
+def _save_local_public_progress(state):
+    with _PUBLIC_PROGRESS_LOCK:
+        saved = _tui_json_load(PUBLIC_PROGRESS_FILE)
+        observations = saved.get("local_observations", {})
+        if not isinstance(observations, dict):
+            observations = {}
+        observations[state["session"]] = {key: state[key] for key in ("baseline", "observed")}
+        saved["local_observations"] = dict(list(observations.items())[-16:])
+        _tui_json_save(PUBLIC_PROGRESS_FILE, saved)
+
+
+def _prepare_local_public_progress(sid, rows):
+    state = _TUI_LOCAL_PUBLIC_PROGRESS
+    previous = (state["session"], state["baseline"], state["observed"])
+    if state["session"] != sid or len(rows) < state["observed"]:
+        with _PUBLIC_PROGRESS_LOCK:
+            saved = _tui_json_load(PUBLIC_PROGRESS_FILE).get("local_observations", {})
+        observation = saved.get(sid, {}) if isinstance(saved, dict) else {}
+        baseline = observation.get("baseline") if isinstance(observation, dict) else None
+        observed = observation.get("observed") if isinstance(observation, dict) else None
+        valid = (type(baseline) is int and type(observed) is int
+                 and 0 <= baseline <= observed <= len(rows))
+        state.update(session=sid, baseline=baseline if valid else len(rows), senders={})
+    state["observed"] = len(rows)
+    if previous != (state["session"], state["baseline"], state["observed"]):
+        _save_local_public_progress(state)
+    return state
+
+
+def _flush_local_public_progress(sid, rows, position, question):
+    state = _TUI_LOCAL_PUBLIC_PROGRESS
+    if not question or position < state["baseline"]:
+        return True
+    key = (position, question)
+    sender = state["senders"].get(key)
+    if sender is None:
+        sender = _GrokPublicProgress(f"{tui_history_path()}:{position}:{question.strip()}", session_id=sid)
+        state["senders"][key] = sender
+        if len(state["senders"]) > 128:
+            state["senders"].pop(next(iter(state["senders"])))
+    fresh = _tui_request_rows_after(rows, position)
+    if any(_tui_public_progress_text(row, sid) for row in fresh):
+        prompt_key = (sid, position, question)
+        prompt_hash = hashlib.sha256(json.dumps(prompt_key).encode("utf-8")).hexdigest()
+        with _PUBLIC_PROGRESS_LOCK:
+            saved = _tui_json_load(PUBLIC_PROGRESS_FILE)
+            prompt_sent = saved.get("prompt_sent", [])
+            if not isinstance(prompt_sent, list):
+                prompt_sent = []
+            if prompt_hash in prompt_sent:
+                _LOCAL_TUI_PROMPTS_SENT.add(prompt_key)
+            elif prompt_key in _LOCAL_TUI_PROMPTS_SENT or _deliver_local_tui_prompt(question, prompt_key):
+                saved["prompt_sent"] = (prompt_sent + [prompt_hash])[-512:]
+                _tui_json_save(PUBLIC_PROGRESS_FILE, saved)
+            else:
+                return False
+    return sender.flush(fresh)
+
+
 
 def mirror_local_tui_turns():
     """커서 이후의 최종답을, 그 답을 부른 질문과 함께 폰으로 올린다 (T-260824-036).
@@ -3641,22 +3960,27 @@ def mirror_local_tui_turns():
         _close_local_progress()
         return 0
     rows = _read_history_rows(tui_history_path())
-    _observe_local_progress(sid, rows)
+    _prepare_local_public_progress(sid, rows)
     finals = _tui_final_answer_indices(rows)
     cur = _tui_cursor_load()
     if cur.get("session_id") != sid:
         _tui_cursor_save(sid, len(finals))
+        _observe_local_progress(sid, rows)
         return 0
     try:
         already = int(cur.get("finals_sent") or 0)
     except (TypeError, ValueError):
         already = 0
     sent = 0
-    for pos in finals[_tui_cursor_clamp(already, len(finals)) :]:
+    already = _tui_cursor_clamp(already, len(finals))
+    for final_number, pos in enumerate(finals[already:], start=already):
         answer = str(rows[pos].get("content") or "").strip()
         if not answer:
             continue
         back, question, background = _tui_answer_origin(rows, pos)
+        if not _flush_local_public_progress(sid, rows[:pos + 1], back, question):
+            _tui_cursor_save(sid, final_number)
+            return sent
         if question:
             _deliver_local_tui_prompt(question, (sid, back, question))
         if background:
@@ -3666,6 +3990,13 @@ def mirror_local_tui_turns():
         sent += 1
     # 보낼 게 0 건이었던 tick 도 커서를 전진시킨다 — 안 그러면 매번 같은 자리를 다시 읽는다.
     _tui_cursor_save(sid, len(finals))
+    questions = [(idx, _tui_user_query_text(row)) for idx, row in enumerate(rows)]
+    questions = [(idx, question) for idx, question in questions if question]
+    if questions:
+        idx, question = questions[-1]
+        if not _flush_local_public_progress(sid, rows, idx, question):
+            return sent
+    _observe_local_progress(sid, rows)
     return sent
 
 
@@ -3692,12 +4023,16 @@ def tui_local_mirror_ticker():
 
 
 def mirror_error(source, text, task_id=None):
-    msg = f"grok 호출 실패: {text}"
+    msg = tr('grok 호출 실패: {v0}', v0=text)
+    if CHAT_LANE != 'tui':
+        msg += '\n' + _flow_progress.recovery_notice('failed', tr=tr)
     local_print(f"{msg} ({source})")
     deliver_mesh_event("error", msg, task_id=task_id)
 
 
 def process_job(source, text, task_id=None):
+    if consume_language_command(text):
+        return
     if slash_token(text) == "/model":
         handle_model_command(text)
         return
@@ -3791,10 +4126,13 @@ def handle_message_text(text, source="telegram"):
     if not text:
         return
 
+    if consume_language_command(text):
+        return
+
     if text.lower() in ("/start", "/ping"):
-        msg = "grok 헤드리스 모드 작동중"
+        msg = tr('grok 헤드리스 모드 작동중')
         local_print(msg)
-        deliver_mesh_event("ack", msg)
+        deliver_mesh_event("report", msg)
         return
 
     if slash_token(text) == "/model":
@@ -3816,7 +4154,7 @@ def handle_message_text(text, source="telegram"):
     # 텔레그램 발화가 아니라 질문이 폰에 안 남는다 — enqueue 즉시 원문을 챗에 미러.
     # telegram 발 [VOICE] 는 이미 사용자 말풍선이 있으므로 미러하지 않는다.
     if source == "local" and text.startswith(VOICE_PROMPT_PREFIX):
-        deliver_mesh_event("final", f"음성 입력: {text[len(VOICE_PROMPT_PREFIX):]}")
+        deliver_mesh_event("final", tr('음성 입력: {v0}', v0=text[len(VOICE_PROMPT_PREFIX):]))
 
     # 사람 텔레그램 + 도는 턴 → 바로 붙여 끊는다 (T-260829-026).
     # 못 넣으면(기계 주입·끄기·한가함) 줄 세움 + 상태줄 표시(T-260823-021).
@@ -4286,6 +4624,8 @@ def telegram_poller():
                 if not text:
                     continue
                 # ★내구화 먼저, offset 전진은 finally 에서 — 순서가 유실 축의 전부다.
+                if consume_language_command(text):
+                    continue
                 inbox_spool(upd.get("update_id"), "telegram", text)
                 preview = text.strip().splitlines()[0][:80]
                 print(f">>> [{NAME}] 텔레그램 grok: {preview}", flush=True)
@@ -4493,8 +4833,22 @@ def start_banner():
 
 def main():
     print(start_banner())
+    note = suggestion_fixture_version_note()
+    if note:
+        print(note, file=sys.stderr)
     start_workers()
-    telegram_poller()
+    control = None
+    if os.environ.get('AGENT_CONTROL_ENABLED') == '1':
+        try:
+            from agent_control_adapters import start_control
+            control = start_control(env('GRB_NODE', NAME), 'grok', module=globals())
+        except ImportError:
+            print('[agent-control] optional module unavailable; bridge preserved', file=sys.stderr)
+    try:
+        telegram_poller()
+    finally:
+        if control:
+            control.close()
 
 
 if __name__ == "__main__":
