@@ -2,11 +2,16 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/grok-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
+![Claude, Codex, Grok, and Cursor — the family of four Telegram bridges by ssamssae](docs/assets/tgbridges_card.jpg)
+
+The four bridges: [Claude Telegram Bridge](https://github.com/ssamssae/claude-telegram-bridge) · [Codex Telegram Bridge](https://github.com/ssamssae/codex-telegram-bridge) · [Grok Telegram Bridge](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor Telegram Bridge](https://github.com/ssamssae/cursor-telegram-bridge).
+
 Text your own private Telegram bot, and the message runs as a Grok turn on your
 computer. Grok's finished answer comes back to your phone.
 
-This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
-the Codex Telegram Bridge, but it keeps its own sessions and credentials.
+This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge, the
+Codex Telegram Bridge, and the Cursor Telegram Bridge, but it keeps its own
+sessions and credentials.
 
 ## New in 0.6.3
 
