@@ -14,6 +14,15 @@ Late background results are labeled separately. They no longer replay an
 unrelated question or finish that question's reply wait. See the
 [0.6.3 release notes](RELEASE_NOTES-0.6.3.md).
 
+## Input now
+
+If you send a message while Grok is still writing, the bridge queues it and
+shows an **Input now** button. Press the button to send the queued message into
+the current turn. The button sends Enter only when the input box is empty and
+a queue hint is on screen. It does not send Ctrl+C or Escape. Set
+`GRB_SEND_NOW_BUTTON=0` to keep the sentence and hide the button. The check
+path is in [Web verification](docs/feature-map.md).
+
 ## New in 0.6.2
 
 When several Grok sessions share a working directory, Telegram replies now stay

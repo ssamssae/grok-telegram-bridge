@@ -312,6 +312,15 @@ _message('Not sent: there is text in the input box.', '입력창에 쓰던 글�
 _message('Not sent: the input box is not visible. Check the local screen.', '입력창이 보이지 않아 보내지 않았어요. 화면을 확인하세요.')
 _message('Nothing is running now. The messages go in automatically.', '지금 실행 중인 작업이 없어요. 곧 자동으로 들어가요.')
 _message('No waiting messages. They already went in.', '기다리는 메시지가 없어요. 이미 들어갔어요.')
+# Input now button while Grok is busy (T-261013-026). Claude "Send now" wording stays unchanged.
+_message('Input now · {count}', '즉시입력 · {count}개')
+_message('{count} message(s) are queued and have not entered the turn. Input now sends them in. A reply being written may stop.', '메시지 {count}개가 대기열에만 있고 아직 턴에 안 들어갔어요. 즉시입력을 누르면 바로 들어가요. 쓰던 답은 끊길 수 있어요.')
+_message('{count} message(s) are queued. They enter when the turn can take them.', '메시지 {count}개가 대기열에 있어요. 턴이 받을 수 있을 때 들어가요.')
+_message('Input now requested ({count}). Checking delivery.', '즉시입력을 요청했어요 ({count}개). 들어갔는지 확인하고 있어요.')
+_message('Input now was already requested.', '이미 즉시입력을 요청했어요.')
+_message('Not sent: the queue is not ready for input now.', '대기열이 즉시입력을 받을 상태가 아니에요. 화면을 확인하세요.')
+_message('The queued message is already in the turn.', '기다리는 메시지가 없어요. 이미 들어갔어요.')
+_message('Not sent: the composer is not empty for input now.', '입력창이 비어 있지 않아 즉시입력을 보내지 않았어요.')
 
 def normalize_language(value: object) -> str:
     code = re.split(r'[-_.]', str(value or '').strip().lower(), maxsplit=1)[0]

@@ -25,6 +25,18 @@ Public hosting is a separate verification step: after publishing, repeat the lan
 390px 화면에서 메뉴·본문이 잘리지 않는지 확인하고, 공개 게시 후에도 실제 HTTPS 주소에서 같은 순서로 확인합니다.
 로컬 확인만으로 공개 게시나 설치된 브릿지 동작을 완료로 판단하지 않습니다.
 
+## Input now while Grok is busy
+
+Prerequisites: the TUI lane, `GRB_BUSY_INJECT=1` (the default), and Grok 1.0.52 queue behavior. While a reply is being written, Enter queues a message. Enter sends the oldest queued item only when the composer is empty and the screen shows `Enter to send now`, `[Send now]`, or `Queued`. Set `GRB_SEND_NOW_BUTTON=0` to keep the sentence and hide the button.
+
+1. Send a personal Telegram message while Grok is still working.
+2. Confirm the bridge queues that message and sends a sentence plus an `Input now · N` button. It does not send an acknowledgement that renders as a single emoji. A second queued message updates the same card's count until the button is pressed.
+3. Press the button. The bridge does not take the work lock. Each press checks the screen again and sends Enter once only when the composer is empty and a queue hint is visible. It repeats up to the queued count and stops when the hint disappears.
+4. Confirm the card changes to “Input now requested (N). Checking delivery.” and the button is removed. That sentence records the key send. The finished turn is a later reply. With the button off, only the waiting sentence is sent.
+5. Confirm no key is sent for another chat, a token from before restart, a card that was already pressed, text in the composer, a suggestion-only composer, or an empty composer without a queue hint. Ctrl+C and Escape are not sent.
+
+This path does not record a live Telegram button click. Merging this repository does not restart an installed bridge.
+
 ## Session isolation and reply recovery
 
 Prerequisites: an authenticated Grok CLI, a configured private Telegram bot,

@@ -812,6 +812,16 @@ TUI_RESTART_TIMEOUT = int_env("GRB_TUI_RESTART_TIMEOUT", 30, minimum=1)
 #   끄려면 GRB_BUSY_INJECT=0 (가역). 기본 ON — 「send a message to interrupt」가
 #   정본 제스처인데 브릿지가 큐만 쌓아서 정지가 안 됐다.
 TUI_BUSY_INJECT = bool_env("GRB_BUSY_INJECT", True)
+# T-261013-026: 작업 중 삽입 안내는 kind=ack 가 아니다. ack 는 개인 채팅에서
+#   노드 이모지 1자만 남는다. 버튼 끄기 = GRB_SEND_NOW_BUTTON=0. 꺼져도 문장은 보낸다.
+#   grok 1.0.52 에서 생성 중 Enter 는 대기열이다. 즉시입력은 빈 칸과 큐 힌트가
+#   보일 때만 Enter 를 보낸다. 버튼은 GROK_LOCK 을 잡지 않는다.
+SEND_NOW_BUTTON = bool_env("GRB_SEND_NOW_BUTTON", True)
+SEND_NOW_CALLBACK_PREFIX = "grb-now:"
+SEND_NOW_HINTS = ("Enter to send now", "[Send now]", "Queued")
+_SEND_NOW_LOCK = threading.Lock()
+_SEND_NOW_CARD = None
+_SEND_NOW_EMPTY_MARKUP = json.dumps({"inline_keyboard": []}, ensure_ascii=False)
 
 
 def float_env(k, default):
@@ -2489,6 +2499,166 @@ def _tui_interrupt_paste(prompt):
         _tui_confirm_submit(payload, baseline)
 
 
+def _send_now_markup(token, count):
+    payload = {
+        "inline_keyboard": [[{
+            "text": tr("Input now · {count}", count=count),
+            "callback_data": SEND_NOW_CALLBACK_PREFIX + token,
+        }]]
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _send_now_body(count):
+    return tr(
+        "{count} message(s) are queued and have not entered the turn. Input now sends them in. A reply being written may stop.",
+        count=count,
+    )
+
+
+def _edit_send_now_card(message_id, text, markup):
+    """같은 안내를 고친다. 실패해도 새 말풍선을 만들지 않는다."""
+    if not message_id:
+        return False
+    result = deliver_mesh_event(
+        "copy_content",
+        text,
+        reply_markup=markup,
+        telegram_method="editMessageText",
+        message_id=message_id,
+    )
+    for delivery in (result or {}).get("deliveries", []):
+        if delivery.get("surface") == SUGGESTED_SURFACE and delivery.get("result") in _ANCHOR_EDIT_OK:
+            return True
+    return False
+
+
+def offer_send_now_card():
+    """작업 중 삽입을 문장으로 알린다. 같은 안내가 살아 있으면 개수만 올린다."""
+    global _SEND_NOW_CARD
+    if not SEND_NOW_BUTTON:
+        deliver_mesh_event(
+            "copy_content",
+            tr(
+                "{count} message(s) are queued. They enter when the turn can take them.",
+                count=1,
+            ),
+        )
+        return
+    with _SEND_NOW_LOCK:
+        card = _SEND_NOW_CARD
+        if card and not card.get("pressed"):
+            card["count"] = int(card.get("count") or 1) + 1
+            snapshot = {
+                "token": card["token"],
+                "count": card["count"],
+                "message_id": card.get("message_id"),
+            }
+            fresh = False
+        else:
+            token = uuid.uuid4().hex[:16]
+            card = {
+                "token": token,
+                "chat_id": str(CHAT_ID),
+                "count": 1,
+                "message_id": None,
+                "pressed": False,
+            }
+            _SEND_NOW_CARD = card
+            snapshot = {"token": token, "count": 1, "message_id": None}
+            fresh = True
+    body = _send_now_body(snapshot["count"])
+    markup = _send_now_markup(snapshot["token"], snapshot["count"])
+    if not fresh:
+        if snapshot.get("message_id"):
+            _edit_send_now_card(snapshot["message_id"], body, markup)
+        return
+    result = deliver_mesh_event("copy_content", body, reply_markup=markup)
+    mid = _first_sent_message_id(result)
+    with _SEND_NOW_LOCK:
+        current = _SEND_NOW_CARD
+        if not current or current.get("token") != snapshot["token"]:
+            return
+        current["message_id"] = mid
+        count_now = int(current.get("count") or 1)
+        pressed = bool(current.get("pressed"))
+    if mid and count_now != snapshot["count"] and not pressed:
+        _edit_send_now_card(mid, _send_now_body(count_now), _send_now_markup(snapshot["token"], count_now))
+
+
+def send_now_pane_ready():
+    """빈 컴포저이고 화면에 큐 힌트가 있을 때만 True."""
+    state = model_composer_state()
+    if state != "empty":
+        return False, state if state in ("draft", "ghost", "unknown") else "unknown"
+    proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+    if getattr(proc, "returncode", 1):
+        return False, "unknown"
+    plain = _strip_ansi(proc.stdout or "")
+    if any(hint in plain for hint in SEND_NOW_HINTS):
+        return True, "ready"
+    return False, "empty"
+
+
+def press_send_now(token, message_id):
+    """준비된 대기열에만 Enter 를 보낸다. C-c 와 Escape 는 쓰지 않는다."""
+    token = str(token or "")
+    if not re.fullmatch(r"[0-9a-f]{16}", token):
+        text = tr("Not sent: the queue is not ready for input now.")
+        _edit_send_now_card(message_id, text, _SEND_NOW_EMPTY_MARKUP)
+        return "unknown", text
+    with _SEND_NOW_LOCK:
+        card = _SEND_NOW_CARD
+        if not card or card.get("token") != token or str(card.get("chat_id")) != str(CHAT_ID):
+            status = "unknown"
+            count = 0
+            mid = message_id
+        elif card.get("pressed"):
+            status = "already"
+            count = 0
+            mid = card.get("message_id") or message_id
+        else:
+            card["pressed"] = True
+            status = "open"
+            count = int(card.get("count") or 1)
+            mid = card.get("message_id") or message_id
+            card["message_id"] = mid
+    if status == "already":
+        text = tr("Input now was already requested.")
+        _edit_send_now_card(mid, text, _SEND_NOW_EMPTY_MARKUP)
+        print(f"{TUI_LOG_KEY} 즉시입력 이미 요청", file=sys.stderr)
+        return "already", text
+    if status == "unknown":
+        text = tr("Not sent: the queue is not ready for input now.")
+        _edit_send_now_card(mid, text, _SEND_NOW_EMPTY_MARKUP)
+        print(f"{TUI_LOG_KEY} 즉시입력 토큰 불일치", file=sys.stderr)
+        return "unknown", text
+    sent = 0
+    reason = "empty"
+    for _ in range(count):
+        ready, reason = send_now_pane_ready()
+        if not ready:
+            break
+        _tmux("send-keys", "-t", TMUX_PANE, "Enter")
+        sent += 1
+        if TUI_SUBMIT_DELAY:
+            time.sleep(TUI_SUBMIT_DELAY)
+    if sent == 0:
+        if reason in ("draft", "ghost"):
+            text = tr("Not sent: the composer is not empty for input now.")
+        elif reason == "empty":
+            text = tr("The queued message is already in the turn.")
+        else:
+            text = tr("Not sent: the queue is not ready for input now.")
+        status = "rejected"
+    else:
+        text = tr("Input now requested ({count}). Checking delivery.", count=sent)
+        status = "sent"
+    _edit_send_now_card(mid, text, _SEND_NOW_EMPTY_MARKUP)
+    print(f"{TUI_LOG_KEY} 즉시입력 {status} sent={sent} reason={reason}", file=sys.stderr)
+    return status, text
+
+
 def maybe_busy_inject_telegram(text, source):
     """넣었으면 ★회수 잡 meta(dict) 를 돌려준다. 안 넣었으면 False.
 
@@ -2523,14 +2693,11 @@ def maybe_busy_inject_telegram(text, source):
     except Exception as exc:  # noqa: BLE001
         print(f"{TUI_LOG_KEY} busy 삽입 실패 — 큐로 넘김: {exc}", file=sys.stderr)
         return False
-    print(f"{TUI_LOG_KEY} busy 중 텔레그램 삽입 (턴 중단)", file=sys.stderr)
+    print(f"{TUI_LOG_KEY} busy 중 텔레그램 대기열 삽입", file=sys.stderr)
     try:
-        deliver_mesh_event(
-            "ack",
-            tr('지금 하던 일에 바로 넣었어. 돌던 작업은 끊을게.'),
-        )
+        offer_send_now_card()
     except Exception as exc:  # noqa: BLE001
-        print(f"{TUI_LOG_KEY} busy 삽입 ack 실패: {exc}", file=sys.stderr)
+        print(f"{TUI_LOG_KEY} 즉시입력 안내 실패: {exc}", file=sys.stderr)
     return {"kind": "injected_harvest", "baseline": baseline}
 
 
@@ -3333,6 +3500,14 @@ def handle_telegram_callback(callback):
     if data.startswith(MODEL_CALLBACK_PREFIX):
         answer()
         apply_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
+        return
+    if data.startswith(SEND_NOW_CALLBACK_PREFIX):
+        token = data[len(SEND_NOW_CALLBACK_PREFIX):]
+        status, text = press_send_now(token, message.get("message_id"))
+        if status == "sent":
+            answer()
+        else:
+            answer(text)
         return
     if not SUGGESTED_REPLY_CONFIRM:
         answer(tr('확인 버튼이 꺼져 있습니다.'))
