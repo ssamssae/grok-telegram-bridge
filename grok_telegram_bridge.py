@@ -1333,6 +1333,8 @@ def handle_tui_reset(source="telegram", task_id=None):
       혼자 일을 시작한다. 큐를 비우고, 이전 확인버튼을 잊고, 사람 글이 올 때까지
       기계 주입을 막는다.
     """
+    with _MODEL_PICKER_LOCK:
+        _MODEL_PICKER.clear()
     _TUI_RESET.set()
     _close_local_progress()
     dropped = drain_pending_jobs()
@@ -3305,7 +3307,12 @@ def _send_model_option_card(selection, stage):
     """Caller holds picker lock. Each delivered step gets a single-use token."""
     _MODEL_PICKER.clear()
     selection = dict(selection, stage=stage, token=os.urandom(8).hex(), created=time.monotonic())
-    if stage == "window":
+    if stage == "model":
+        values = selection["models"]
+        current = current_tui_model() if CHAT_LANE == "tui" else ""
+        labels = [("✓ " if model == current else "") + model for model in values]
+        body = tr('현재 세션 모델: {current}\n모델을 선택하세요. CLI 기본 모델도 함께 변경됩니다.\n직접 입력: /model <모델 ID>\n{models}', current=current or tr("미확인"), models="\n".join(values))
+    elif stage == "window":
         values = selection["options"]["windows"]
         labels = [_model_window_label(value) for value in values]
         body = tr('모델: {model}\n컨텍스트 크기를 선택하세요.', model=selection["model"])
@@ -3328,7 +3335,7 @@ def begin_model_choice(model):
     """Collect native model settings before submitting one complete command."""
     with _MODEL_PICKER_LOCK:
         _MODEL_PICKER.clear()
-        if is_awaiting_human() or CHAT_LANE != "tui":
+        if CHAT_LANE != "tui":
             deliver_mesh_event("copy_content", tr('모델 변경은 연결된 Grok TUI 세션에서 지원합니다.'))
             return
         try:
@@ -3374,7 +3381,9 @@ def press_model_option(data, message_id):
         if not valid:
             return tr('이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.')
         _MODEL_PICKER.clear()  # Consume before a send or native submission, including failures.
-        if selection["stage"] == "window":
+        if selection["stage"] == "model":
+            begin_model_choice(selection["values"][index])
+        elif selection["stage"] == "window":
             selection["window"] = selection["values"][index]
             _advance_model_choice(selection)
         else:
@@ -3534,21 +3543,19 @@ def handle_model_command(text):
         return
     with _MODEL_PICKER_LOCK:
         _MODEL_PICKER.clear()
-    try:
-        models = available_models()
-        current = current_tui_model() if CHAT_LANE == "tui" else ""
-        rows = [[{"text": ("✓ " if model == current else "") + model,
-                  "callback_data": MODEL_CALLBACK_PREFIX + model}]
-                for model in models if len((MODEL_CALLBACK_PREFIX + model).encode()) <= 64]
-        msg = tr('현재 세션 모델: {current}\n모델을 선택하세요. CLI 기본 모델도 함께 변경됩니다.\n직접 입력: /model <모델 ID>\n{models}', current=current or tr("미확인"), models="\n".join(models))
-        deliver_mesh_event("copy_content", msg, reply_markup=json.dumps({"inline_keyboard": rows}))
-    except (GrokExecError, OSError, subprocess.SubprocessError):
-        deliver_mesh_event("copy_content", tr('모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.'))
+        try:
+            models = available_models()
+            tui_follow_session_rotation()
+            _send_model_option_card({"models": models, "session_id": tui_session_id()}, "model")
+        except (GrokExecError, OSError, subprocess.SubprocessError):
+            deliver_mesh_event("copy_content", tr('모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.'))
 
 
 def apply_model_choice(model, *, context_window=None, effort=None, expected_session=None):
     """Model control has no assistant turn/history answer; verify CLI metadata instead."""
-    if is_awaiting_human():
+    # A fresh, session-bound human picker may change settings without resuming
+    # inference. Unbound calls and all queued/machine work keep the clear wait.
+    if is_awaiting_human() and expected_session is None:
         deliver_mesh_event("copy_content", tr('클리어 뒤 대기 중입니다. 먼저 대화를 재개하세요.'))
         return
     if CHAT_LANE != "tui":
@@ -3642,9 +3649,6 @@ def handle_telegram_callback(callback):
     if str(chat.get("id")) != str(CHAT_ID):
         answer(tr('이 채팅의 버튼이 아니야'))
         return
-    if is_awaiting_human():
-        answer(tr('클리어 뒤라 이전 버튼은 안 먹어'))
-        return
     data = str(cb.get("data") or "")
     if data.startswith((MODEL_CALLBACK_PREFIX, MODEL_OPTION_CALLBACK_PREFIX)):
         sender = cb.get("from") if isinstance(cb.get("from"), dict) else {}
@@ -3655,8 +3659,10 @@ def handle_telegram_callback(callback):
         answer(press_model_option(data, message.get("message_id")))
         return
     if data.startswith(MODEL_CALLBACK_PREFIX):
-        answer()
-        begin_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
+        answer(tr('이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.'))
+        return
+    if is_awaiting_human():
+        answer(tr('클리어 뒤라 이전 버튼은 안 먹어'))
         return
     if data.startswith(SEND_NOW_CALLBACK_PREFIX):
         token = data[len(SEND_NOW_CALLBACK_PREFIX):]
@@ -4366,6 +4372,8 @@ def process_job(source, text, task_id=None):
     if consume_language_command(text):
         return
     if slash_token(text) == "/model":
+        if is_awaiting_human() and source != "telegram":
+            return
         handle_model_command(text)
         return
 
@@ -4468,6 +4476,8 @@ def handle_message_text(text, source="telegram"):
         return
 
     if slash_token(text) == "/model":
+        if is_awaiting_human() and source != "telegram":
+            return
         handle_model_command(text)
         return
 

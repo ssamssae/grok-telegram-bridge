@@ -91,4 +91,10 @@ and the CLI model catalog for the effective account.
 
 The public model-controls test exercises this path without credentials. Installed
 bridge validation is recorded separately from this unit test. Only the final
-selection changes settings; active work, drafts, queues, and clear holds block it.
+selection changes settings; active work, drafts, and queues block it.
+
+Release 0.6.6: after `/clear`, open a fresh `/model` menu and repeat the same
+sequence. Confirm settings are applied while the wait for human conversation
+remains active. Machine input cannot resume work. Cards from before clear or
+restart, including legacy model buttons, must expire. Clear invalidates every
+stage even when the native restart fails.
