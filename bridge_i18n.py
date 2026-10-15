@@ -21,6 +21,11 @@ def _message(en: str, ko: str, *, source: str | None = None) -> None:
 
 
 _message('Language: {language}\nUse /language en or /language ko.', '현재 언어: {language}\n/language ko 또는 /language en으로 변경하세요.')
+_message('Model: {model}\nChoose a context window.', '모델: {model}\n컨텍스트 크기를 선택하세요.')
+_message('Model: {model}\nContext window: {window}\nChoose reasoning effort.', '모델: {model}\n컨텍스트: {window}\neffort를 선택하세요.')
+_message('Could not read the model settings catalog. Use /model to try again.', '모델 설정 목록을 확인하지 못했습니다. /model로 다시 확인하세요.')
+_message('This model selection card expired. Use /model to choose again.', '이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.')
+_message('Model settings confirmed: {model}\nContext window: {window}\nReasoning effort: {effort}', '모델 설정 확인: {model}\n컨텍스트: {window}\neffort: {effort}')
 _message('telegram-agent-bridge setup complete. Background service is running. Send /ping to test the bridge.', '브릿지 설정을 완료했습니다. 백그라운드 서비스가 실행 중입니다. /ping으로 연결을 확인하세요.')
 _message('telegram-agent-bridge setup complete. Background service is not running ({status}). Start it with: {command}. Then send /ping to test the bridge.', '브릿지 설정을 완료했습니다. 백그라운드 서비스는 실행 중이 아닙니다 ({status}). 다음 명령으로 시작한 뒤 /ping으로 확인하세요: {command}')
 _message('telegram-agent-bridge setup complete. Send /ping to test the bridge.', '브릿지 설정을 완료했습니다. /ping으로 연결을 확인하세요.')

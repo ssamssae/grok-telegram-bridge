@@ -3232,7 +3232,11 @@ def mark_suggested_pressed(chat_id, message_id):
 
 
 MODEL_CALLBACK_PREFIX = "grb-model:"
+MODEL_OPTION_CALLBACK_PREFIX = "grb-model-option:"
 MODEL_VERIFY_TIMEOUT = 3.0
+MODEL_PICKER_TTL = 600
+_MODEL_PICKER = {}
+_MODEL_PICKER_LOCK = threading.RLock()
 
 
 def available_models():
@@ -3254,12 +3258,128 @@ def available_models():
 
 
 def current_tui_model():
+    return str(current_tui_model_settings().get("current_model_id") or "")
+
+
+def current_tui_model_settings():
     try:
         path = os.path.join(os.path.dirname(tui_history_path()), "summary.json")
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        return str(data.get("current_model_id") or "")
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def available_model_settings(model):
+    """Use the effective account's CLI cache, refreshed by available_models()."""
+    try:
+        with open(os.path.join(GROK_HOME_EFFECTIVE, "models_cache.json"), encoding="utf-8") as fh:
+            info = json.load(fh)["models"][model]["info"]
+        windows = info.get("context_windows") or [info["context_window"]]
+        if (not isinstance(windows, list) or not windows
+                or any(type(value) is not int or value <= 0 for value in windows)):
+            raise ValueError("invalid context windows")
+        efforts = []
+        if type(info.get("supports_reasoning_effort")) is not bool:
+            raise ValueError("missing effort capability")
+        if info.get("supports_reasoning_effort"):
+            for row in info["reasoning_efforts"]:
+                value = row["value"]
+                if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", value):
+                    raise ValueError("invalid effort")
+                if value not in efforts:
+                    efforts.append(value)
+            if not efforts:
+                raise ValueError("missing efforts")
+        return {"windows": list(dict.fromkeys(windows)), "efforts": efforts}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise GrokExecError("model settings catalog unavailable") from exc
+
+
+def _model_window_label(value):
+    return f"{value // 1000}K" if value % 1000 == 0 else str(value)
+
+
+def _send_model_option_card(selection, stage):
+    """Caller holds picker lock. Each delivered step gets a single-use token."""
+    _MODEL_PICKER.clear()
+    selection = dict(selection, stage=stage, token=os.urandom(8).hex(), created=time.monotonic())
+    if stage == "window":
+        values = selection["options"]["windows"]
+        labels = [_model_window_label(value) for value in values]
+        body = tr('모델: {model}\n컨텍스트 크기를 선택하세요.', model=selection["model"])
+    else:
+        values = selection["options"]["efforts"]
+        labels = values
+        body = tr('모델: {model}\n컨텍스트: {window}\neffort를 선택하세요.',
+                  model=selection["model"], window=_model_window_label(selection["window"]))
+    selection["values"] = values
+    rows = [[{"text": label, "callback_data": f"{MODEL_OPTION_CALLBACK_PREFIX}{selection['token']}:{index}"}]
+            for index, label in enumerate(labels)]
+    result = deliver_mesh_event("copy_content", body, reply_markup=json.dumps({"inline_keyboard": rows}))
+    mid = _first_sent_message_id(result)
+    if mid:
+        selection["message_id"] = str(mid)
+        _MODEL_PICKER.update(selection)
+
+
+def begin_model_choice(model):
+    """Collect native model settings before submitting one complete command."""
+    with _MODEL_PICKER_LOCK:
+        _MODEL_PICKER.clear()
+        if is_awaiting_human() or CHAT_LANE != "tui":
+            deliver_mesh_event("copy_content", tr('모델 변경은 연결된 Grok TUI 세션에서 지원합니다.'))
+            return
+        try:
+            if model not in available_models():
+                deliver_mesh_event("copy_content", tr('선택할 수 없는 모델입니다. /model 목록을 다시 확인하세요.'))
+                return
+            options = available_model_settings(model)
+            tui_follow_session_rotation()
+            sid = tui_session_id()
+            if not sid:
+                raise GrokExecError("missing session")
+            selection = {"model": model, "session_id": sid, "options": options}
+            if len(options["windows"]) > 1:
+                _send_model_option_card(selection, "window")
+            else:
+                selection["window"] = options["windows"][0]
+                _advance_model_choice(selection)
+        except (GrokExecError, OSError, subprocess.SubprocessError):
+            deliver_mesh_event("copy_content", tr('모델 설정 목록을 확인하지 못했습니다. /model로 다시 확인하세요.'))
+
+
+def _advance_model_choice(selection):
+    if selection["options"]["efforts"]:
+        _send_model_option_card(selection, "effort")
+    else:
+        apply_model_choice(selection["model"], context_window=selection["window"],
+                           expected_session=selection["session_id"])
+
+
+def press_model_option(data, message_id):
+    with _MODEL_PICKER_LOCK:
+        selection = dict(_MODEL_PICKER)
+        try:
+            token, raw_index = data[len(MODEL_OPTION_CALLBACK_PREFIX):].split(":")
+            index = int(raw_index)
+            valid = (token == selection.get("token")
+                     and str(message_id) == selection.get("message_id")
+                     and time.monotonic() - selection["created"] <= MODEL_PICKER_TTL
+                     and selection["session_id"] == tui_session_id()
+                     and 0 <= index < len(selection["values"]))
+        except (ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            return tr('이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.')
+        _MODEL_PICKER.clear()  # Consume before a send or native submission, including failures.
+        if selection["stage"] == "window":
+            selection["window"] = selection["values"][index]
+            _advance_model_choice(selection)
+        else:
+            apply_model_choice(selection["model"], context_window=selection["window"],
+                               effort=selection["values"][index], expected_session=selection["session_id"])
         return ""
 
 
@@ -3410,8 +3530,10 @@ def suggestion_fixture_version_note():
 def handle_model_command(text):
     parts = text.split(maxsplit=1)
     if len(parts) == 2:
-        apply_model_choice(parts[1].strip())
+        begin_model_choice(parts[1].strip())
         return
+    with _MODEL_PICKER_LOCK:
+        _MODEL_PICKER.clear()
     try:
         models = available_models()
         current = current_tui_model() if CHAT_LANE == "tui" else ""
@@ -3424,7 +3546,7 @@ def handle_model_command(text):
         deliver_mesh_event("copy_content", tr('모델 목록 조회 실패. 잠시 후 /model로 다시 확인하세요.'))
 
 
-def apply_model_choice(model):
+def apply_model_choice(model, *, context_window=None, effort=None, expected_session=None):
     """Model control has no assistant turn/history answer; verify CLI metadata instead."""
     if is_awaiting_human():
         deliver_mesh_event("copy_content", tr('클리어 뒤 대기 중입니다. 먼저 대화를 재개하세요.'))
@@ -3436,6 +3558,11 @@ def apply_model_choice(model):
         if model not in available_models():
             deliver_mesh_event("copy_content", tr('선택할 수 없는 모델입니다. /model 목록을 다시 확인하세요.'))
             return
+        if context_window is not None or effort is not None:
+            options = available_model_settings(model)
+            if ((context_window is not None and context_window not in options["windows"])
+                    or (effort is not None and effort not in options["efforts"])):
+                raise GrokExecError("settings no longer available")
     except (GrokExecError, OSError, subprocess.SubprocessError):
         deliver_mesh_event("copy_content", tr('모델 목록 조회 실패로 변경하지 않았습니다.'))
         return
@@ -3443,6 +3570,10 @@ def apply_model_choice(model):
         deliver_mesh_event("copy_content", tr('작업 중입니다. 끝난 뒤 모델을 선택하세요.'))
         return
     try:
+        tui_follow_session_rotation()
+        if expected_session is not None and tui_session_id() != expected_session:
+            deliver_mesh_event("copy_content", tr('이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.'))
+            return
         if not tui_session_alive() or not _tui_repl_idle_probe():
             deliver_mesh_event("copy_content", tr('터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.'))
             return
@@ -3455,15 +3586,33 @@ def apply_model_choice(model):
         if state != "empty":
             deliver_mesh_event("copy_content", tr('터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.'))
             return
-        tui_follow_session_rotation()
-        if current_tui_model() == model:
+        if context_window is None and effort is None and current_tui_model() == model:
             deliver_mesh_event("copy_content", tr('현재 세션은 이미 {v0}입니다.', v0=model))
             return
-        _tui_paste(f"/model {model}", confirm_submit=False, clear_composer=False)
+        command = f"/model {model}"
+        if context_window is not None:
+            command += f" {context_window}"
+        if effort is not None:
+            command += f" {effort}"
+        def before_submit(sid, _path, _baseline):
+            if expected_session is not None and sid != expected_session:
+                raise GrokExecError("session changed before model submission")
+        kwargs = {"before_submit": before_submit} if expected_session is not None else {}
+        _tui_paste(command, confirm_submit=False, clear_composer=False, **kwargs)
         deadline = time.monotonic() + MODEL_VERIFY_TIMEOUT
         while True:
-            if current_tui_model() == model:
-                deliver_mesh_event("copy_content", tr('모델 변경 확인: {v0}\nCLI 기본 모델도 함께 변경됩니다.', v0=model))
+            settings = current_tui_model_settings() if context_window is not None or effort is not None else {}
+            if (current_tui_model() == model
+                    and (expected_session is None or tui_session_id() == expected_session)
+                    and (context_window is None or settings.get("context_window") == context_window)
+                    and (effort is None or settings.get("reasoning_effort") == effort)
+                    and (context_window is None or model_composer_state() in ("empty", "ghost"))):
+                if context_window is not None:
+                    body = tr('모델 설정 확인: {model}\n컨텍스트: {window}\neffort: {effort}',
+                              model=model, window=_model_window_label(context_window), effort=effort or "—")
+                else:
+                    body = tr('모델 변경 확인: {v0}\nCLI 기본 모델도 함께 변경됩니다.', v0=model)
+                deliver_mesh_event("copy_content", body)
                 return
             if time.monotonic() >= deadline:
                 deliver_mesh_event("copy_content", tr('모델 변경 결과 미확인. 자동 재전송하지 않았습니다. /model로 현재 상태를 확인하세요.'))
@@ -3497,9 +3646,17 @@ def handle_telegram_callback(callback):
         answer(tr('클리어 뒤라 이전 버튼은 안 먹어'))
         return
     data = str(cb.get("data") or "")
+    if data.startswith((MODEL_CALLBACK_PREFIX, MODEL_OPTION_CALLBACK_PREFIX)):
+        sender = cb.get("from") if isinstance(cb.get("from"), dict) else {}
+        if sender and str(sender.get("id")) != str(CHAT_ID):
+            answer(tr('이 채팅의 버튼이 아니야'))
+            return
+    if data.startswith(MODEL_OPTION_CALLBACK_PREFIX):
+        answer(press_model_option(data, message.get("message_id")))
+        return
     if data.startswith(MODEL_CALLBACK_PREFIX):
         answer()
-        apply_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
+        begin_model_choice(data[len(MODEL_CALLBACK_PREFIX):])
         return
     if data.startswith(SEND_NOW_CALLBACK_PREFIX):
         token = data[len(SEND_NOW_CALLBACK_PREFIX):]
