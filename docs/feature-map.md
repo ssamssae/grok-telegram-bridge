@@ -76,3 +76,19 @@ uses temporary histories and a captured sender, without changing a live session.
 
 Public export and regression suite: 30 tests (5 other-engine skips). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
 GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
+
+## Model, context window, and effort cards (0.6.5)
+
+Prerequisites: a configured private bot, an idle Grok TUI with an empty composer,
+and the CLI model catalog for the effective account.
+
+1. Send `/model` and select a model, including the current model.
+2. Select a context window (for example 256K or 500K), then reasoning effort.
+3. Confirm the final card reports all selected values and the same session's
+   metadata matches them. A single-window or non-reasoning model skips that step.
+4. Repeat a previous button press. It must not submit another native command.
+   New menus, expired cards, session changes, and bridge restarts invalidate old options.
+
+The public model-controls test exercises this path without credentials. Installed
+bridge validation is recorded separately from this unit test. Only the final
+selection changes settings; active work, drafts, queues, and clear holds block it.

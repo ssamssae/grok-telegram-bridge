@@ -27,10 +27,34 @@ class ModelControlsTest(unittest.TestCase):
 
     def test_model_callback_does_not_require_suggestion_buttons(self):
         b = self.bridge
-        with mock.patch.object(b, 'tg'), mock.patch.object(b, 'apply_model_choice') as apply:
+        with mock.patch.object(b, 'tg'), mock.patch.object(b, 'begin_model_choice') as apply:
             b.handle_telegram_callback({'id':'q','data':'grb-model:grok-4.7',
                 'message':{'chat':{'id':b.CHAT_ID}}})
         apply.assert_called_once_with('grok-4.7')
+
+    def test_model_window_effort_cards_submit_once_in_public_build(self):
+        b = self.bridge
+        mid = 10
+        def send(method, **kw):
+            nonlocal mid
+            mid += 1
+            return {'ok': True, 'result': {'message_id': mid}}
+        with mock.patch.object(b, 'tg', side_effect=send), \
+             mock.patch.object(b, 'available_models', return_value=['grok-4.7']), \
+             mock.patch.object(b, 'available_model_settings', return_value={'windows':[256000,500000],'efforts':['high','low']}), \
+             mock.patch.object(b, 'tui_follow_session_rotation'), \
+             mock.patch.object(b, 'tui_session_id', return_value='session'), \
+             mock.patch.object(b, 'apply_model_choice') as apply:
+            b.begin_model_choice('grok-4.7')
+            first = dict(b._MODEL_PICKER)
+            self.assertEqual(first['stage'], 'window')
+            b.press_model_option(b.MODEL_OPTION_CALLBACK_PREFIX + first['token'] + ':1', first['message_id'])
+            second = dict(b._MODEL_PICKER)
+            self.assertEqual(second['stage'], 'effort')
+            data = b.MODEL_OPTION_CALLBACK_PREFIX + second['token'] + ':0'
+            b.press_model_option(data, second['message_id'])
+            b.press_model_option(data, second['message_id'])
+            apply.assert_called_once_with('grok-4.7',context_window=500000,effort='high',expected_session='session')
 
     def test_unknown_model_cannot_reach_terminal(self):
         b = self.bridge

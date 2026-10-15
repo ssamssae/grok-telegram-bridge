@@ -8,6 +8,13 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
+## New in 0.6.5
+
+`/model` now guides you through model, context window, and reasoning effort.
+Choices come from your CLI catalog. The bridge applies all settings once after
+the final choice and checks all three values. [Release notes](RELEASE_NOTES-0.6.5.md).
+
+
 ## New in 0.6.3
 
 Late background results are labeled separately. They no longer replay an
