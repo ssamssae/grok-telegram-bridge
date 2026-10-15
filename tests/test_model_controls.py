@@ -17,20 +17,22 @@ class ModelControlsTest(unittest.TestCase):
         b = self.bridge
         with mock.patch.object(b, 'available_models', return_value=['grok-4.7','grok-4.6']), \
              mock.patch.object(b, 'current_tui_model', return_value='grok-4.6'), \
+             mock.patch.object(b, 'tui_follow_session_rotation'), \
+             mock.patch.object(b, 'tui_session_id', return_value='session'), \
              mock.patch.object(b, 'tg', return_value={'ok':True,'result':{'message_id':1}}) as tg:
             b.handle_message_text('/model')
         self.assertTrue(b.JOBS.empty())
         self.assertEqual(tg.call_args.args[0], 'sendMessage')
         self.assertIn('grok-4.7', tg.call_args.kwargs['text'])
         buttons = json.loads(tg.call_args.kwargs['reply_markup'])['inline_keyboard']
-        self.assertEqual(buttons[0][0]['callback_data'], 'grb-model:grok-4.7')
+        self.assertTrue(buttons[0][0]['callback_data'].startswith('grb-model-option:'))
 
-    def test_model_callback_does_not_require_suggestion_buttons(self):
+    def test_legacy_model_callback_expires(self):
         b = self.bridge
         with mock.patch.object(b, 'tg'), mock.patch.object(b, 'begin_model_choice') as apply:
             b.handle_telegram_callback({'id':'q','data':'grb-model:grok-4.7',
                 'message':{'chat':{'id':b.CHAT_ID}}})
-        apply.assert_called_once_with('grok-4.7')
+        apply.assert_not_called()
 
     def test_model_window_effort_cards_submit_once_in_public_build(self):
         b = self.bridge
@@ -44,8 +46,12 @@ class ModelControlsTest(unittest.TestCase):
              mock.patch.object(b, 'available_model_settings', return_value={'windows':[256000,500000],'efforts':['high','low']}), \
              mock.patch.object(b, 'tui_follow_session_rotation'), \
              mock.patch.object(b, 'tui_session_id', return_value='session'), \
+             mock.patch.object(b, 'is_awaiting_human', return_value=True), \
              mock.patch.object(b, 'apply_model_choice') as apply:
-            b.begin_model_choice('grok-4.7')
+            b.handle_message_text('/model')
+            menu = dict(b._MODEL_PICKER)
+            b.handle_telegram_callback({'id':'q','data':b.MODEL_OPTION_CALLBACK_PREFIX+menu['token']+':0',
+                'message':{'chat':{'id':b.CHAT_ID},'message_id':menu['message_id']}})
             first = dict(b._MODEL_PICKER)
             self.assertEqual(first['stage'], 'window')
             b.press_model_option(b.MODEL_OPTION_CALLBACK_PREFIX + first['token'] + ':1', first['message_id'])
@@ -55,6 +61,8 @@ class ModelControlsTest(unittest.TestCase):
             b.press_model_option(data, second['message_id'])
             b.press_model_option(data, second['message_id'])
             apply.assert_called_once_with('grok-4.7',context_window=500000,effort='high',expected_session='session')
+            self.assertTrue(b.is_awaiting_human())
+            self.assertTrue(b.JOBS.empty())
 
     def test_unknown_model_cannot_reach_terminal(self):
         b = self.bridge
