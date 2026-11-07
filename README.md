@@ -8,6 +8,14 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
+## New in 0.6.7
+
+Open `/model` cards stay pinned in your private chat until you choose, they
+expire, or the bridge restarts (`GRB_QUESTION_PIN=0` turns this off). The
+progress card has a Stop button (`GRB_STOP_BUTTON=0` hides it), a turn you
+cancel closes as interrupted, and the progress card and final answer reply to
+your message. [Release notes](RELEASE_NOTES-0.6.7.md).
+
 ## New in 0.6.5
 
 `/model` now guides you through model, context window, and reasoning effort.
