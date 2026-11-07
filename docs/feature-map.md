@@ -98,3 +98,29 @@ sequence. Confirm settings are applied while the wait for human conversation
 remains active. Machine input cannot resume work. Cards from before clear or
 restart, including legacy model buttons, must expire. Clear invalidates every
 stage even when the native restart fails.
+
+## Pinned model cards, Stop button, and threaded answers (0.6.7)
+
+Prerequisites: a configured private bot and the TUI lane connected to one tmux
+pane. Pinning works only in a private chat; a group chat is never pinned.
+
+1. Send `/model`. Confirm the model card is pinned at the top of the chat
+   without a notification sound.
+2. Send a few other messages. Confirm the open card stays reachable from the
+   pinned list and that no duplicate card is sent.
+3. Choose a model. Confirm the model card is unpinned and the context window
+   card is pinned instead; repeat through the effort card. After the final
+   choice no bridge pin remains. An expired card or a bridge restart also
+   unpins.
+4. Send a long request. Confirm the progress card replies to your message and
+   shows Stop. Press Stop once: Grok ends the turn as cancelled and the card
+   closes as interrupted, without an error message. Pressing Stop again, or
+   pressing a card from before a restart, sends nothing.
+5. Confirm the final answer of a normal request replies to the message that
+   asked, and that a reply still arrives when that message was deleted.
+
+`tests/test_grok_question_pins.py` and `tests/test_public_export.py` cover the
+pin ledger, the one-call-per-tick limit, bounded retries, the chat binding, and
+the edit and reply delivery paths without credentials. `GRB_QUESTION_PIN=0` and
+`GRB_STOP_BUTTON=0` turn the features off. Merging this repository does not
+restart an installed bridge.
