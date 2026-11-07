@@ -8,6 +8,20 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
+## New in 0.6.9
+
+`python3 bridge_setup.py doctor` checks an install at any time and changes
+nothing: `bridge.env` and the token file, the token with Telegram (`--offline`
+skips that call), the `grok` CLI, the tmux session and the Grok in its pane, the
+background service, linger on Linux, and any Grok running on another terminal.
+Each line reads `[ok]`, `[warn]`, or `[fail]`, and any `[fail]` makes it exit
+with 1. Setup now ends by pointing at it. Setup also keeps a copy of a service
+file that it did not write before it replaces that file: the copy goes next to
+`bridge.env`, and an interactive setup asks first. `--dry-run` lists the files
+already there that setup would write over. See
+[When It Does Not Work](#when-it-does-not-work) and the
+[release notes](RELEASE_NOTES-0.6.9.md).
+
 ## New in 0.6.8
 
 `python3 bridge_setup.py setup` sets the bridge up with one command, the way
@@ -195,7 +209,11 @@ phone uses. If the session is missing, `grok-tg` starts it first. Press
 another terminal is not connected to your phone, and setup warns when it sees
 one. Answer `n` to keep the public defaults described below (headless lane,
 nothing mirrored). `--like-author` skips the question. `--dry-run` prints the
-plan and does not write, start, or send anything.
+plan, with the files already there that setup would write over, and does not
+write, start, or send anything. Setup keeps a copy of a service file that it
+did not write before it replaces that file: the copy goes next to `bridge.env`,
+and an interactive setup asks first. Run `python3 bridge_setup.py doctor` any
+time to check the install again.
 
 ### Step 1 — Create your own bot
 
@@ -342,6 +360,28 @@ worse than no protection because it looks like it worked. Use permission rules
 (`--deny`) for the TUI lane instead.
 
 ## When It Does Not Work
+
+**Start with the doctor.** In the cloned folder, run:
+
+```bash
+python3 bridge_setup.py doctor
+```
+
+It prints one line per check, marked `[ok]`, `[warn]`, or `[fail]` with a
+short reason, and it exits with 1 when any check fails. It changes nothing.
+
+- `bridge.env` and the token file exist, only your user can read them, and the
+  chat id is set. The token itself is never printed.
+- Telegram accepts the token: one `getMe` call. `--offline` skips it.
+- The `grok` CLI is found.
+- In the TUI lane: tmux is installed, the bridge's tmux session is running, and
+  Grok runs in its pane.
+- The background service is loaded (launchd) or active (`systemd --user`). On
+  Linux the doctor also checks linger. Without linger, the service stops when
+  you log out. The doctor prints the command that turns it on
+  (`sudo loginctl enable-linger $USER`); it does not run it.
+- A Grok that runs on another terminal is not connected to your phone. The
+  doctor warns about it; use `grok-tg` instead.
 
 **Nothing comes back at all.**
 Check the terminal where you started the bridge. If it says the token file is
