@@ -108,6 +108,37 @@ class PublicExportTest(unittest.TestCase):
         self.assertEqual(calls[0][0], "sendMessage")
         self.assertIn("entities", calls[0][1])
 
+    def test_progress_edit_keeps_its_buttons(self):
+        """Editing text without reply_markup removes the keyboard, so the edit forwards it."""
+        mod = load_bridge("grb_edit_markup")
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": True},
+        ):
+            mod.deliver_mesh_event(
+                "report", "still working", telegram_method="editMessageText",
+                message_id=5, reply_markup='{"inline_keyboard": []}',
+            )
+        self.assertEqual(calls[0][0], "editMessageText")
+        self.assertEqual(calls[0][1].get("reply_markup"), '{"inline_keyboard": []}')
+
+    def test_reply_survives_a_deleted_question(self):
+        """A reply to a deleted message must still be delivered, as the internal bus does."""
+        mod = load_bridge("grb_reply_missing")
+        calls = []
+        with mock.patch.object(
+            mod,
+            "tg",
+            lambda method, timeout=60, **params: calls.append((method, params))
+            or {"ok": True, "result": {"message_id": 8}},
+        ):
+            mod.deliver_mesh_event("final", "answer", reply_to_message_id=9)
+        self.assertEqual(calls[0][1].get("reply_to_message_id"), 9)
+        self.assertEqual(calls[0][1].get("allow_sending_without_reply"), "true")
+
     def test_trailing_suggested_reply_is_split(self):
         open_m = "<" + "추천답변" + ">"
         close_m = "</" + "추천답변" + ">"
