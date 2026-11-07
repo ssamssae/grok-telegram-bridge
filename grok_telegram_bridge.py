@@ -1637,6 +1637,69 @@ class _GrokTurnWatch:
             self.offset = start + consumed
             return self
 
+    @classmethod
+    def open_turn(cls, path, session_id):
+        """터미널에서 시작해 ★이미 열려 있는 턴을 묶는다 (T-261107-014).
+
+        붙여넣기 뒤 첫 turn_started 를 기다리는 __init__ 과 달리, 꼬리에서 끝 기록이 없는
+        마지막 turn_started 를 이 감시의 턴으로 삼는다. 열린 턴이 없거나 다른 세션 것이면
+        None — 그때는 버튼을 붙이지 않는다(모르면 묶지 않는다, __init__ 과 같은 계약).
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        start = max(0, size - _TURN_EVENTS_TAIL_BYTES)
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(size - start)
+        except OSError:
+            return None
+        if start:
+            # 꼬리를 줄 중간에서 잘랐다 — 첫 조각은 버리고 다음 줄부터 읽는다.
+            cut = data.find(b"\n")
+            if cut < 0:
+                return None
+            start += cut + 1
+            data = data[cut + 1:]
+        wanted = str(session_id or "")
+        turn = None
+        consumed = 0
+        for raw in data.splitlines(keepends=True):
+            if not raw.endswith(b"\n"):
+                break
+            line_at = start + consumed
+            consumed += len(raw)
+            if b'"turn_' not in raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            kind = row.get("type")
+            if kind == "turn_started":
+                sid = str(row.get("session_id") or "")
+                if wanted and sid and sid != wanted:
+                    turn = None
+                    continue
+                turn = {"offset": line_at, "number": row.get("turn_number")}
+            elif kind == "turn_ended":
+                turn = None
+        if turn is None:
+            return None
+        watch = cls.__new__(cls)
+        watch.path = path
+        watch.session_id = wanted
+        watch.turn = turn
+        watch.ended = None
+        watch.lock = threading.Lock()
+        watch.offset = start + consumed
+        watch.usable = True
+        return watch
+
 
 def _grok_public_assistant(row, session_id=""):
     if not isinstance(row, dict):
@@ -4766,7 +4829,7 @@ class _GrokProgressAnchor:
             self.closed = True
 
 
-_TUI_LOCAL_PROGRESS = {"session": None, "observed": 0, "key": None, "anchor": None}
+_TUI_LOCAL_PROGRESS = {"session": None, "observed": 0, "key": None, "anchor": None, "watch": None}
 _TUI_LOCAL_PUBLIC_PROGRESS = {"session": None, "observed": 0, "baseline": 0, "senders": {}}
 # T-260914-005: 같은 터미널 질문을 진행 중·최종답에서 두 번 보내지 않는다.
 _LOCAL_TUI_PROMPTS_SENT = set()
@@ -4777,6 +4840,7 @@ def _close_local_progress():
     if anchor:
         anchor.close(False, reset=True)
         _TUI_LOCAL_PROGRESS["anchor"] = None
+    _TUI_LOCAL_PROGRESS["watch"] = None
 
 
 _HANDOFF_CARD = None
@@ -4850,7 +4914,7 @@ def _mark_phone_progress_observed(request_text=""):
     state = _TUI_LOCAL_PROGRESS
     if state["session"] != sid:
         _close_local_progress()
-        state.update(session=sid, observed=observed, key=None, anchor=None)
+        state.update(session=sid, observed=observed, key=None, anchor=None, watch=None)
     else:
         state["observed"] = max(state["observed"], observed)
 
@@ -4861,7 +4925,7 @@ def _observe_local_progress(sid, rows):
     if state["session"] != sid or len(rows) < state["observed"]:
         if state["anchor"]:
             state["anchor"].close(False, reset=True)
-        state.update(session=sid, observed=len(rows), key=None, anchor=None)
+        state.update(session=sid, observed=len(rows), key=None, anchor=None, watch=None)
         return
     questions = [(idx, _tui_user_query_text(row)) for idx, row in enumerate(rows)]
     questions = [(idx, text) for idx, text in questions if text]
@@ -4876,7 +4940,7 @@ def _observe_local_progress(sid, rows):
     if key != state["key"]:
         if state["anchor"]:
             state["anchor"].close(False, reset=True)
-        state.update(key=key, anchor=None)
+        state.update(key=key, anchor=None, watch=None)
         if idx >= state["observed"] and not complete and not failed:
             _deliver_local_tui_prompt(question, key)
             state["anchor"] = _GrokProgressAnchor()
@@ -4886,6 +4950,7 @@ def _observe_local_progress(sid, rows):
         return
     if complete or failed:
         anchor.close(complete and not failed, text="작업 중단 · 오류 발생" if failed else None)
+        state["watch"] = None
         return
     details = _tui_tool_call_details(fresh)
     stage = _tui_progress_line(details)
@@ -4893,6 +4958,50 @@ def _observe_local_progress(sid, rows):
     if stage != getattr(anchor, "stage", None) or now - anchor.last_edit >= TUI_PROGRESS_EDIT_INTERVAL:
         anchor.update(_tui_progress_line(details, now - anchor.started))
         anchor.stage = stage
+    _offer_local_stop_button(state, sid, anchor)
+
+
+def _offer_local_stop_button(state, sid, anchor):
+    """터미널에서 시작한 턴의 진행 카드에도 「중지」를 붙인다 (T-261107-014).
+
+    폰 턴은 붙여넣기 직후 첫 turn_started 를 묶지만(offer_stop_button 의 폰 잡 경로),
+    터미널 턴은 이미 열린 채 발견되므로 events.jsonl 꼬리의 열린 turn_started 를 묶는다.
+    묶이면 폰 턴과 같은 버튼·같은 누름 경로(press_stop)·같은 회수(anchor.close)다.
+    열린 턴을 못 묶으면 버튼 없이 종전 진행 카드만 간다. 사람이 터미널에서 Ctrl+C 로
+    끊어 최종답 없이 끝난 턴은 카드를 「중단」으로 닫는다 — 안 그러면 다음 요청까지
+    「아직 하고 있어」가 남는다(원칙 6).
+    카드 하나는 턴 하나만 묶는다. 묶은 턴이 끝나면 state["watch"] 를 False 로 남겨,
+    최종답 줄을 기다리며 열려 있는 카드가 뒤에 열린 다른 턴(폰 턴 포함)의 버튼을 가져가지
+    않게 한다. 새 질문·세션이 바뀌면 None 으로 돌아가 다시 묶는다.
+    """
+    if not STOP_BUTTON or anchor is None or anchor.closed or not anchor.message_id:
+        return False
+    watch = state.get("watch")
+    if watch is False:
+        return False
+    if watch is None:
+        try:
+            watch = _GrokTurnWatch.open_turn(_tui_events_path(tui_history_path()), sid)
+        except Exception as exc:  # noqa: BLE001 — 감시가 깨져도 진행 카드·최종답은 종전대로 간다
+            print(f"{TUI_LOG_KEY} 터미널 턴 묶기 실패 — 버튼 없이 계속: {exc}", file=sys.stderr)
+            return False
+        if watch is None:
+            return False
+        state["watch"] = watch
+    try:
+        watch.poll()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 터미널 턴 감시 실패 — 버튼 없이 계속: {exc}", file=sys.stderr)
+        state["watch"] = None
+        return False
+    ended = watch.ended
+    if ended:
+        retire_stop_button(anchor)
+        state["watch"] = False
+        if ended["outcome"] == "cancelled" and ended["trigger"] in USER_CANCEL_TRIGGERS:
+            anchor.close(False, interrupted=ended["trigger"])
+        return False
+    return offer_stop_button(anchor, watch)
 
 
 def _save_local_public_progress(state):
@@ -5153,6 +5262,9 @@ def job_worker():
             JOBS.task_done()
             health_mark(last_job_done_at=time.time(), done=1)
 
+
+
+VOICE_PROMPT_PREFIX = "[VOICE] "
 
 
 def handle_message_text(text, source="telegram", reply_to=None):

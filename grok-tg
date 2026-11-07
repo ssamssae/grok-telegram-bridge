@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# grok-tg - attach this terminal to the Grok session the bridge controls.
+#
+# bridge_setup.py links ~/.local/bin/grok-tg to this file. It reads the tmux
+# socket and session from bridge.env, starts the session first when it is
+# missing, and never detaches another terminal. Options go to
+# `bridge_setup.py attach` (--config PATH, --no-create).
+set -euo pipefail
+PY="${GRB_PYTHON:-python3}"
+HERE="$("$PY" -c 'import os, sys; print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}")"
+exec "$PY" "$HERE/bridge_setup.py" attach "$@"

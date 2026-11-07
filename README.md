@@ -8,6 +8,17 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
+## New in 0.6.8
+
+`python3 bridge_setup.py setup` sets the bridge up with one command, the way
+the author runs it: the TUI lane with terminal turns mirrored to your phone, a
+background service, the `grok-tg` attach command, and a self-check of both
+directions. See [Like the author](#like-the-author-one-command). A turn that you
+start in the terminal now gets the Stop button on its phone progress card too.
+Text typed into the bridge's own local input reaches Grok again instead of
+stopping with an error, and a restarted tmux session resumes the saved Grok
+conversation again. [Release notes](RELEASE_NOTES-0.6.8.md).
+
 ## New in 0.6.7
 
 Open `/model` cards stay pinned in your private chat until you choose, they
@@ -142,6 +153,49 @@ guarantee that CLI usage is covered by a subscription. Check your account's term
 ## Quick Start
 
 Five steps. Nothing here assumes you have made a bot before.
+
+### Like the author: one command
+
+Create your bot (Step 1) and clone the repository (Step 3). Then run one command
+in the cloned folder instead of Steps 2, 4, 5 and 6:
+
+```bash
+python3 bridge_setup.py setup
+```
+
+Its first question is `Use the author's setup (recommended)? [Y/n]`. Press
+Enter for yes. Only two things still need you: paste the bot token at the
+hidden prompt, and send `/start` to your bot when setup asks. Setup does the
+rest:
+
+- It writes `~/.config/grok-telegram-bridge/token.json`, readable only by your
+  user, and `~/.config/grok-telegram-bridge/bridge.env`. It backs up an
+  existing `bridge.env` first and keeps its other settings.
+- It turns on the switches in the table below.
+- It starts Grok in the tmux session `grok` on the socket `grok`.
+- It installs a background service (launchd on macOS, `systemd --user` on
+  Linux), so the bridge starts again when you log in.
+- It adds the `grok-tg` command.
+- It sends a test message and checks each direction once: a message from your
+  phone reaches Grok in the terminal and the answer comes back (60 seconds),
+  and a short probe typed into the Grok session reaches your phone (90
+  seconds). The results go to the terminal and to your chat. Each check is one
+  short Grok turn.
+
+| Switch | What it turns on |
+| --- | --- |
+| `GRB_CHAT_LANE=tui` | Grok runs in a visible tmux session instead of one hidden `grok -p` run per message |
+| `GRB_TUI_MIRROR_LOCAL=1` | Prompts you type in that session reach your phone too, with the progress card, its Stop button, and the answer |
+| `GRB_TUI_FALLBACK_HEADLESS=0` | When the session is gone, the bridge reports it instead of answering from a hidden process |
+| `GRB_STOP_BUTTON=1`, `GRB_SEND_NOW_BUTTON=1`, `GRB_QUESTION_PIN=1` | The Stop and Input now buttons and the pinned `/model` cards stay on |
+
+From then on, type `grok-tg` in any terminal to join the Grok session that your
+phone uses. If the session is missing, `grok-tg` starts it first. Press
+`Ctrl+B`, then `D`, to detach; Grok keeps running. A Grok that you start in
+another terminal is not connected to your phone, and setup warns when it sees
+one. Answer `n` to keep the public defaults described below (headless lane,
+nothing mirrored). `--like-author` skips the question. `--dry-run` prints the
+plan and does not write, start, or send anything.
 
 ### Step 1 — Create your own bot
 
