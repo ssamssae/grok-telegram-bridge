@@ -303,6 +303,17 @@ class GrokExecError(RuntimeError):
     pass
 
 
+class GrokTurnCancelled(GrokExecError):
+    """그록 네이티브 턴이 취소로 끝났다 (T-261013-033). 실패가 아니라 중단이다.
+
+    trigger = events.jsonl cancellation_context 의 값(ctrl_c·esc·send_now·shutdown 등).
+    """
+
+    def __init__(self, trigger=""):
+        self.trigger = str(trigger or "")
+        super().__init__(f"그록 턴 취소 ({self.trigger or 'unknown'})")
+
+
 def _read(path):
     try:
         with open(path) as f:
@@ -822,6 +833,23 @@ SEND_NOW_HINTS = ("Enter to send now", "[Send now]", "Queued")
 _SEND_NOW_LOCK = threading.Lock()
 _SEND_NOW_CARD = None
 _SEND_NOW_EMPTY_MARKUP = json.dumps({"inline_keyboard": []}, ensure_ascii=False)
+# T-261013-033: 진행 카드 「중지」 — 클로드·코덱스 중지 버튼(T-261006-001)과 같은 계약.
+#   그록 Esc 는 턴을 안 끊는다. 빈 입력칸의 Ctrl+C 1회가 끊는다(설명서 03-keyboard-shortcuts,
+#   4노드 events.jsonl trigger=ctrl_c 실측). 취소 중 Ctrl+C 는 종료 쪽으로 넘어가므로
+#   카드 하나에 한 번만 보낸다. 끄기 = GRB_STOP_BUTTON=0. 버튼은 GROK_LOCK 을 잡지 않는다.
+STOP_BUTTON = bool_env("GRB_STOP_BUTTON", True)
+STOP_CALLBACK_PREFIX = "grb-stop:"
+# 화면에 하나라도 보여야 「도는 턴」이다. [stop] 은 상태줄의 그록 중지 버튼이다.
+#   Esc:cancel 은 쉬는 입력칸 바닥에도 있어 실행 표시가 아니다(실캡처 grok-empty-box.txt,
+#   T-260830-052). 백그라운드 명령 대기도 도는 턴이다(_TUI_TURN_STARTED_MARKERS 와 같다).
+STOP_RUNNING_MARKERS = ("[stop]", "Ctrl+c:cancel", "command still running", "commands still running")
+# 사람이 멈춘 취소만 「중단」이다. shutdown·max_turns 등은 종전 실패 경로로 간다.
+#   mouse = 화면의 [stop], dashboard_stop = 대시보드 중지 (설명서 10-hooks StopCancelled).
+USER_CANCEL_TRIGGERS = frozenset({"ctrl_c", "esc", "mouse", "dashboard_stop", "send_now"})
+# 보이면 Ctrl+C 가 다른 뜻이 된다 — 질문 카드·하위 작업 확인 창·취소 진행 중.
+STOP_BLOCKING_MARKERS = ("Waiting on answers", "Stop them?", "keep running", "Cancelling")
+_STOP_LOCK = threading.Lock()
+_STOP_CARD = None
 
 
 def float_env(k, default):
@@ -834,6 +862,10 @@ def float_env(k, default):
 
 TUI_POLL_INTERVAL = float_env("GRB_TUI_POLL_INTERVAL", 0.5)
 TUI_SUBMIT_DELAY = float_env("GRB_TUI_SUBMIT_DELAY", 0.3)
+# T-261013-033: 네이티브 turn_ended 뒤 최종답·공개 진행 행이 늦게 붙을 틈.
+TUI_TURN_END_GRACE = float_env("GRB_TUI_TURN_END_GRACE", 3.0)
+# 중지 키 뒤 하위 작업 확인 창이 그려질 틈.
+STOP_SETTLE_SEC = float_env("GRB_STOP_SETTLE_SEC", 0.6)
 # ⚠️ 제거 금지 (DO NOT REMOVE) — 붙여넣기 ≠ 제출 (T-260830-045).
 #   실측 2026-08-30 macOS 노드 19:11: load/paste 로 글은 입력칸에 들어갔는데 턴이 시작조차
 #   안 됐다. 폰은 180초 뒤 「무진전」만 봤다. 발사 직후 히스토리 새 user 행 또는
@@ -1487,6 +1519,125 @@ def _read_history_rows(path):
     return rows
 
 
+def _tui_events_path(history_path):
+    """그록이 턴 경계를 적는 곳 — chat_history.jsonl 옆 events.jsonl (4노드 실측, T-261013-033)."""
+    return os.path.join(os.path.dirname(history_path), "events.jsonl")
+
+
+_TURN_EVENTS_TAIL_BYTES = 262144
+# 턴 안에서만 찍히는 기록. 경계 없이 이게 보이면 열린 턴인지 알 수 없다.
+_TURN_ACTIVITY_EVENTS = (b'"phase_changed"', b'"loop_started"', b'"first_token"', b'"tool_started"',
+                         b'"tool_completed"', b'"permission_requested"', b'"permission_resolved"')
+
+
+def _events_tail_turn_state(path, size):
+    """붙여넣기 직전 꼬리의 마지막 턴 경계 = "idle" | "open" | "unknown".
+
+    경계가 없으면: 파일 전체를 읽었고 턴 활동 기록도 없을 때만 idle 이다 — /clear 뒤
+    새 대화는 MCP 시작 기록만 있다(제어 노드 실기록 재생 76건).
+    """
+    if size <= 0:
+        return "idle"
+    start = max(0, size - _TURN_EVENTS_TAIL_BYTES)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            data = fh.read(size - start)
+    except OSError:
+        return "unknown"
+    activity = False
+    for raw in reversed(data.splitlines()):
+        if b'"turn_' not in raw:
+            activity = activity or any(marker in raw for marker in _TURN_ACTIVITY_EVENTS)
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        kind = row.get("type") if isinstance(row, dict) else None
+        if kind == "turn_ended":
+            return "idle"
+        if kind == "turn_started":
+            return "open"
+    return "idle" if start == 0 and not activity else "unknown"
+
+
+class _GrokTurnWatch:
+    """이 잡의 그록 네이티브 턴 하나를 events.jsonl 로 묶는다 (T-261013-033).
+
+    붙여넣기 직전 파일 끝 뒤의 첫 turn_started 가 이 잡의 턴이다. 그때 이미 열린 턴이
+    있거나(터미널 작업 중) 꼬리에서 경계를 못 읽으면 묶지 않는다 — 그때는 종전 화면·
+    히스토리 판정만 쓴다. 파일이 없으면 새 대화라 열린 턴이 없다.
+    """
+
+    def __init__(self, path, session_id):
+        self.path = path
+        self.session_id = str(session_id or "")
+        self.turn = None
+        self.ended = None
+        self.lock = threading.Lock()
+        try:
+            self.offset = os.path.getsize(path)
+        except OSError:
+            self.offset = 0
+            state = "idle"
+        else:
+            state = _events_tail_turn_state(path, self.offset)
+        self.usable = state == "idle"
+
+    def poll(self):
+        """새로 붙은 완결 줄만 읽는다. 쓰는 중인 마지막 줄은 다음 폴로 미룬다."""
+        with self.lock:
+            if not self.usable or self.ended:
+                return self
+            try:
+                if os.path.getsize(self.path) < self.offset:
+                    # 파일이 바뀌어 짧아졌다 — 읽던 위치가 무의미하니 감시를 끈다.
+                    self.usable = False
+                    return self
+                with open(self.path, "rb") as fh:
+                    fh.seek(self.offset)
+                    data = fh.read()
+            except OSError:
+                return self
+            start = self.offset
+            consumed = 0
+            for raw in data.splitlines(keepends=True):
+                if not raw.endswith(b"\n"):
+                    break
+                line_at = start + consumed
+                consumed += len(raw)
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                kind = row.get("type")
+                if kind == "turn_started" and self.turn is None:
+                    sid = str(row.get("session_id") or "")
+                    if self.session_id and sid and sid != self.session_id:
+                        self.usable = False
+                        break
+                    self.turn = {"offset": line_at, "number": row.get("turn_number")}
+                elif kind == "turn_started":
+                    # 끝 기록 없이 다음 턴이 시작됐다(그록 재기동 등). 이 턴은 끝났고, 뒤에 오는
+                    # 끝 기록은 다음 턴 것이다 — macOS 노드 실기록 재생에서 1건 실측.
+                    self.ended = {"outcome": "superseded", "trigger": "", "at": time.time()}
+                    break
+                elif kind == "turn_ended" and self.turn is not None:
+                    context = row.get("cancellation_context")
+                    context = context if isinstance(context, dict) else {}
+                    self.ended = {
+                        "outcome": str(row.get("outcome") or ""),
+                        "trigger": str(context.get("trigger") or context.get("reason") or ""),
+                        "at": time.time(),
+                    }
+                    break
+            self.offset = start + consumed
+            return self
+
+
 def _grok_public_assistant(row, session_id=""):
     if not isinstance(row, dict):
         return False
@@ -1623,6 +1774,31 @@ def _tui_is_background_completion(row):
         ):
             return True
     return False
+
+
+# 남의 턴이 먼저 시작됐다는 표지 — 배경 작업 완료·알림 비우기·끼어들기 (T-261013-033).
+_FOREIGN_TURN_REASONS = ("task_completed", "notification_drain", "interjection")
+
+
+def _tui_turn_owner(rows, request_text):
+    """붙여넣기 뒤 첫 턴 시작 행이 이 잡의 질문이면 True, 남의 것이면 False, 아직 모르면 None.
+
+    events.jsonl 의 첫 turn_started 가 이 잡의 턴이라는 가정은, 붙여넣기 직전 1~2초 사이에
+    배경 작업 완료 턴이나 터미널 입력이 먼저 시작되면 깨진다(검토 지적). 대화 기록은 턴
+    순서대로 쌓이므로 첫 턴 시작 행이 이 질문일 때만 그 턴을 이 잡의 턴으로 본다.
+    """
+    needle = (request_text or "").strip()
+    if not needle:
+        return None
+    for row in rows:
+        query = _tui_user_query_text(row)
+        if query:
+            return query == needle
+        if _tui_is_background_completion(row) or (
+            isinstance(row, dict) and row.get("synthetic_reason") in _FOREIGN_TURN_REASONS
+        ):
+            return False
+    return None
 
 
 def _tui_answer_origin(rows, position):
@@ -1995,7 +2171,7 @@ def _tui_failure_reason_label(reason):
     return text
 
 
-def _tui_progress_done_line(elapsed, ok=True, reset=False, reason=None):
+def _tui_progress_done_line(elapsed, ok=True, reset=False, reason=None, interrupted=None):
     """앵커 마감 한 줄. 답 본문은 기존 mirror_answer 가 따로 배달한다.
 
     앵커를 그냥 두면 답이 온 뒤에도 「아직 하고 있어」가 위에 남는다 — 끝난 걸 끝났다고
@@ -2007,9 +2183,16 @@ def _tui_progress_done_line(elapsed, ok=True, reset=False, reason=None):
     ★/clear 로 접힌 턴은 에러 통이 안 따라온다 (process_job 이 mirror_error 없이
       return). handle_tui_reset ack 와 겹치지 않게 이 말풍선만 「이 턴은 접었다」고
       마감한다 (T-260825-003 회신).
+    ★그록이 턴을 취소로 끝냈으면 실패가 아니라 중단이다 (T-261013-033). 즉시입력
+      (send_now)은 대기하던 메시지가 이어서 답하므로 안내를 붙이지 않는다.
     """
     if reset:
         return f"중단 · {_tui_elapsed_words(elapsed)} 만에"
+    if interrupted:
+        line = f"중단 · {_tui_elapsed_words(elapsed)} 만에"
+        if interrupted == "send_now":
+            return line + " · 대기하던 메시지를 바로 넣었어요"
+        return line + "\n" + _flow_progress.recovery_notice("interrupt", tr=tr)
     if not ok:
         label = _tui_failure_reason_label(reason)
         if label:
@@ -2661,6 +2844,196 @@ def press_send_now(token, message_id):
     return status, text
 
 
+def retire_send_now_card():
+    """새 잡이 시작되면 지난 턴의 즉시입력 안내를 닫는다 (T-261013-033).
+
+    잡은 하나씩 돈다. 다음 잡이 시작됐으면 앞 턴은 끝났고, 대기열 글은 그록이 다음
+    턴으로 넣는다. 안 닫으면 다음 삽입이 오래된 안내의 개수만 올린다. 눌린 안내는
+    결과 문장이 이미 있으니 잊기만 한다. ★화면에 대기열 힌트가 아직 있으면 남은 글이
+    있다 — 즉시입력이 여전히 쓸모 있으니 닫지 않는다(검토 지적).
+    """
+    global _SEND_NOW_CARD
+    with _SEND_NOW_LOCK:
+        card = _SEND_NOW_CARD
+    if not card:
+        return
+    live = not card.get("pressed") and card.get("message_id")
+    if live:
+        proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+        plain = _strip_ansi(proc.stdout or "") if not getattr(proc, "returncode", 1) else ""
+        if not plain or any(hint in plain for hint in SEND_NOW_HINTS):
+            return
+    with _SEND_NOW_LOCK:
+        if _SEND_NOW_CARD is card:
+            _SEND_NOW_CARD = None
+    if not live:
+        return
+    _edit_send_now_card(
+        card["message_id"],
+        tr("The input queue wait ended. Messages that could not be processed are reported separately."),
+        _SEND_NOW_EMPTY_MARKUP,
+    )
+
+
+def _stop_markup(token):
+    return json.dumps(
+        {"inline_keyboard": [[{"text": tr("Stop"), "callback_data": STOP_CALLBACK_PREFIX + token}]]},
+        ensure_ascii=False,
+    )
+
+
+def _clear_stop_keyboard(message_id):
+    """버튼만 지운다. 글은 진행 앵커가 따로 고친다."""
+    if not message_id:
+        return
+    try:
+        tg(
+            "editMessageReplyMarkup",
+            timeout=10,
+            chat_id=CHAT_ID,
+            message_id=int(message_id),
+            reply_markup=_SEND_NOW_EMPTY_MARKUP,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"{TUI_LOG_KEY} 중지 버튼 정리 실패: {exc}", file=sys.stderr)
+
+
+def offer_stop_button(anchor, watch):
+    """이 잡의 네이티브 턴이 묶이면 진행 카드에 「중지」를 한 번 붙인다. 붙였으면 True."""
+    global _STOP_CARD
+    if not STOP_BUTTON or CHAT_LANE != "tui" or anchor is None or watch is None:
+        return False
+    message_id = getattr(anchor, "message_id", None)
+    if getattr(anchor, "handoff", None) or not message_id or not watch.turn or watch.ended:
+        return False
+    stale = None
+    with _STOP_LOCK:
+        card = _STOP_CARD
+        if card and card.get("anchor") is anchor:
+            return False
+        if card and not card.get("closed"):
+            card["closed"] = True
+            stale = card.get("message_id")
+        token = uuid.uuid4().hex[:16]
+        _STOP_CARD = {
+            "token": token,
+            "anchor": anchor,
+            "watch": watch,
+            "message_id": int(message_id),
+            "session_id": watch.session_id,
+            "turn": dict(watch.turn),
+            "attempted": False,
+            "closed": False,
+        }
+    if stale and str(stale) != str(message_id):
+        _clear_stop_keyboard(stale)
+    try:
+        tg(
+            "editMessageReplyMarkup",
+            timeout=10,
+            chat_id=CHAT_ID,
+            message_id=int(message_id),
+            reply_markup=_stop_markup(token),
+        )
+    except Exception as exc:  # noqa: BLE001 — 다음 앵커 편집이 버튼을 다시 싣는다
+        print(f"{TUI_LOG_KEY} 중지 버튼 표시 실패: {exc}", file=sys.stderr)
+    return True
+
+
+def stop_button_markup(anchor):
+    """진행 앵커 편집에 실을 버튼. 텍스트만 고치면 텔레그램이 버튼을 지운다."""
+    with _STOP_LOCK:
+        card = _STOP_CARD
+        if not card or card.get("anchor") is not anchor or card.get("closed") or card.get("attempted"):
+            return None
+        return _stop_markup(card["token"])
+
+
+def retire_stop_button(anchor):
+    """앵커가 닫히거나 네이티브 턴이 끝나면 버튼을 거둔다. 거뒀으면 True."""
+    if anchor is None:
+        return False
+    with _STOP_LOCK:
+        card = _STOP_CARD
+        if not card or card.get("anchor") is not anchor or card.get("closed"):
+            return False
+        card["closed"] = True
+        message_id = card.get("message_id")
+    _clear_stop_keyboard(message_id)
+    return True
+
+
+def _stop_screen_state():
+    """running | blocked | idle | unknown — 화면만 본다. 키는 안 보낸다."""
+    proc = _tmux("capture-pane", "-p", "-J", "-t", TMUX_PANE)
+    if getattr(proc, "returncode", 1):
+        return "unknown"
+    plain = _strip_ansi(proc.stdout or "").lower()
+    if any(marker.lower() in plain for marker in STOP_BLOCKING_MARKERS):
+        return "blocked"
+    if any(marker.lower() in plain for marker in STOP_RUNNING_MARKERS):
+        return "running"
+    return "idle"
+
+
+def press_stop(token, message_id):
+    """카드의 턴이 지금 돌 때만 Ctrl+C 를 한 번 보낸다. 반환 = (status, 안내문).
+
+    클로드 TelegramStopButtons 와 같은 순서다: 확인 → 시도 기록 → 키 1회 → 버튼 제거.
+    ★키는 확인과 같은 잠금 안에서 바로 보낸다. 버튼 제거(네트워크, 최대 수십 초)를 먼저 하면
+      그사이 턴이 끝나고 다음 잡이 붙여넣은 칸이나 취소 중인 화면에 Ctrl+C 가 간다(검토 지적).
+    확인한 누름은 결과와 상관없이 버튼을 거둔다 — 나중 누름이 재시도가 되지 않게.
+    """
+    token = str(token or "")
+    delivered = None
+    with _STOP_LOCK:
+        card = _STOP_CARD
+        live_mid = card and not card.get("closed") and str(card.get("message_id")) == str(message_id)
+        if (not card or not re.fullmatch(r"[0-9a-f]{16}", token) or card.get("token") != token
+                or str(card.get("message_id")) != str(message_id)):
+            status = "stale"
+        elif card.get("attempted"):
+            status = "already"
+        elif card.get("closed"):
+            status = "ended"
+        else:
+            watch = card["watch"]
+            watch.poll()
+            if watch.ended or not watch.turn or watch.turn.get("offset") != card["turn"].get("offset"):
+                status = "ended"
+            elif ((tui_session_id() or "") != card["session_id"] or _stop_screen_state() != "running"
+                    or model_composer_state() != "empty"):
+                status = "rejected"
+            else:
+                card["attempted"] = True
+                status = "send"
+                try:
+                    proc = _tmux("send-keys", "-t", TMUX_PANE, "C-c")
+                    delivered = getattr(proc, "returncode", 1) == 0
+                except Exception as exc:  # noqa: BLE001
+                    print(f"{TUI_LOG_KEY} 중지 키 실패: {exc}", file=sys.stderr)
+                    delivered = False
+            card["closed"] = True
+    if status == "stale":
+        if not live_mid:
+            _clear_stop_keyboard(message_id)
+        return status, tr("This request has already ended.")
+    # 이미 누른 카드도 지운다 — 늦게 도착한 진행 편집이 죽은 버튼을 다시 그릴 수 있다.
+    _clear_stop_keyboard(message_id)
+    if status == "already":
+        return status, tr("Stop was already requested. Check the result before trying again.")
+    if status == "ended":
+        return status, tr("This request has already ended.")
+    if status == "rejected":
+        return status, tr("The running task changed. Check the current card or local screen.")
+    if not delivered:
+        return "uncertain", tr("Stop delivery is unconfirmed. Check the local screen; do not retry.")
+    time.sleep(STOP_SETTLE_SEC)
+    if _stop_screen_state() == "blocked":
+        return "sent", tr("Grok is asking in the terminal whether to stop its running subagents too. Choose there.")
+    return "sent", tr("Stop requested. Waiting for confirmation.")
+
+
 def maybe_busy_inject_telegram(text, source):
     """넣었으면 ★회수 잡 meta(dict) 를 돌려준다. 안 넣었으면 False.
 
@@ -2684,6 +3057,12 @@ def maybe_busy_inject_telegram(text, source):
     if not _TUI_JOB_ACTIVE.is_set():
         return False
     if slash_token(text) in TUI_RESET_TOKENS:
+        return False
+    # 질문 카드·하위 작업 확인 창이 열려 있으면 Enter·숫자가 그 창의 선택이 된다 —
+    #   붙이지 않고 일반 대기열로 보낸다 (T-261013-033 검토 지적).
+    prompt_open = _stop_screen_state() == "blocked"
+    if prompt_open:
+        print(f"{TUI_LOG_KEY} 그록 선택 창이 열려 있음 — busy 삽입 대신 대기열", file=sys.stderr)
         return False
     try:
         baseline = len(_read_history_rows(tui_history_path()))
@@ -2822,11 +3201,15 @@ def _tui_rescue_after_rotation(prompt, started_at):
     return "", True
 
 
-def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", request_text=""):
+def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", request_text="", turn_watch=None):
     """baseline 이후 최종답 1개를 기다린다. 없으면 GrokExecError.
 
     run_grok_tui 와 재기동 회수가 같은 대기 루프를 쓴다 — 잘라내는 기준이
     갈리면 회수 쪽이 답을 버리고 본 루프만 성공하는 구멍이 생긴다.
+
+    turn_watch(T-261013-033) = 이 잡에 묶인 그록 네이티브 턴. 붙여넣기 뒤 첫 턴이 이 질문일
+    때만 쓴다. 턴이 묶이면 진행 카드에 「중지」를 붙이고, 사람이 멈춘 취소로 끝나면 무진전
+    상한을 기다리지 않고 바로 끝낸다. 완료·오류·그 밖의 취소는 종전 판정 그대로다.
     """
     _TUI_RESET.clear()
     started = time.time()
@@ -2843,6 +3226,8 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
     # on_progress 가 돌려주는 배달 모드. "anchor" = 말풍선 1통을 고쳐 쓰는 중,
     #   "message" = 새 말풍선 경로(앵커 실패·기능 OFF), "" = 아직 한 통도 안 보냄.
     progress_mode = ""
+    # 이 잡이 붙여넣은 질문이 붙여넣기 뒤 첫 턴인가 (None = 아직 모름, T-261013-033).
+    turn_owner = None
     task_id = getattr(getattr(on_progress, "__self__", None), "task_id", None)
     session_id = os.path.basename(os.path.dirname(path)) if os.path.basename(path) == "chat_history.jsonl" else ""
     public_progress = _GrokPublicProgress(f"{path}:{baseline}:{request_text.strip()}",
@@ -2859,6 +3244,8 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
         if last is None:
             # An older turn may finish between the busy insertion and its user row.
             return []
+        if _turn_mirror.handoff_context(request_text, NAME, "grok"):
+            _deliver_local_tui_prompt(request_text, (tui_session_id(), baseline + last, needle))
         following = rows[last + 1:]
         for stop, item in enumerate(following):
             if _tui_user_query_text(item) or _tui_is_background_completion(item):
@@ -2919,6 +3306,31 @@ def _tui_wait_for_final(path, baseline, on_progress=None, rescue_prompt="", requ
                 time.sleep(TUI_POLL_INTERVAL)
                 continue
             return str(finals[-1].get("content") or "").strip()
+        ended = None
+        if turn_watch is not None:
+            try:
+                if turn_owner is None:
+                    turn_owner = _tui_turn_owner(rows[baseline:], request_text)
+                if turn_owner is False:
+                    print(f"{TUI_LOG_KEY} 다른 턴이 먼저 시작됨 — 턴 감시 끔", file=sys.stderr)
+                    turn_watch = None
+                else:
+                    turn_watch.poll()
+                    anchor = getattr(on_progress, "__self__", None)
+                    if turn_watch.ended:
+                        retire_stop_button(anchor)
+                        ended = turn_watch.ended if turn_owner else None
+                    elif turn_watch.turn and turn_owner:
+                        offer_stop_button(anchor, turn_watch)
+            except Exception as exc:  # noqa: BLE001 — 감시가 깨져도 답은 종전 판정으로 받는다
+                print(f"{TUI_LOG_KEY} 턴 감시 실패 — 종전 판정으로 계속: {exc}", file=sys.stderr)
+                turn_watch = None
+                ended = None
+        # 사람이 멈춘 취소만 바로 끝낸다. 오류는 그록이 대개 다음 턴으로 이어 가므로
+        # (macOS 노드 실기록 48건 중 45건) 종전 판정이 그 턴의 답을 받는다(검토 지적).
+        if (ended and ended["outcome"] == "cancelled" and ended["trigger"] in USER_CANCEL_TRIGGERS
+                and time.time() - ended["at"] >= TUI_TURN_END_GRACE):
+            raise GrokTurnCancelled(ended["trigger"])
         now = time.time()
         if TUI_STALL_ALERT_SEC:
             for call_id, detail in open_calls.items():
@@ -3058,8 +3470,11 @@ def run_grok_tui(prompt, on_progress=None, source=None):
     """
     if not tui_session_alive():
         raise GrokExecError(tui_dead_message())
+    watch_box = {}
 
     def remember_submission(session_id, path, baseline):
+        # 네이티브 턴 경계의 기준선도 첫 tmux 입력 전에 잰다 (T-261013-033).
+        watch_box["watch"] = _GrokTurnWatch(_tui_events_path(path), session_id)
         # 세션 추종 뒤, 첫 tmux 입력 전에 기록해야 재기동도 같은 턴을 회수한다.
         _tui_inflight_write(
             {
@@ -3080,6 +3495,7 @@ def run_grok_tui(prompt, on_progress=None, source=None):
         on_progress=on_progress,
         rescue_prompt=prompt,
         request_text=prompt,
+        turn_watch=watch_box.get("watch"),
     )
     return answer, None, session_id
 
@@ -3240,6 +3656,181 @@ MODEL_PICKER_TTL = 600
 _MODEL_PICKER = {}
 _MODEL_PICKER_LOCK = threading.RLock()
 
+# ── 미응답 선택 카드 고정 (T-261107-009) ──────────────────────────────────────
+# 답을 기다리는 카드 = 모델 선택 카드(모델→컨텍스트→effort). 열려 있는 동안 개인 대화
+# 상단에 조용히 고정하고, 답·만료·세션 교체·재시작으로 닫히면 그 카드만 해제한다.
+# 고정은 표시일 뿐 답변·권한이 아니다. 틱당 API 호출 1회, 행위별 60초 간격 최대 3회,
+# 호출 전에 소유 필드를 저장하므로 응답을 잃어도 그 카드만 해제할 수 있다.
+# 잠금 순서: 선택 카드 잠금 → 고정 저장소 잠금 (반대 순서로는 잡지 않는다).
+QUESTION_PIN_FILE = os.path.join(STATE_DIR, f"grok-bridge-{NAME}.question-pins.json")
+QUESTION_PIN_RETRY_SECONDS = 60
+QUESTION_PIN_MAX_ATTEMPTS = 3
+QUESTION_PIN_TICK_INTERVAL = max(1, int_env("GRB_QUESTION_PIN_TICK_INTERVAL", 5))
+_QUESTION_PIN_FIELDS = ("pin_managed", "pin_confirmed", "pin_action", "pin_attempts", "pin_retry_at")
+_QUESTION_PIN_LOCK = threading.RLock()
+_QUESTION_PIN_WAKE = threading.Event()
+_question_pin_clock = time.time
+
+
+def _question_pins_load():
+    try:
+        with open(QUESTION_PIN_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _question_pins_save(items):
+    os.makedirs(os.path.dirname(QUESTION_PIN_FILE), exist_ok=True)
+    tmp = QUESTION_PIN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(items, fh, ensure_ascii=False)
+    os.replace(tmp, QUESTION_PIN_FILE)
+
+
+def _question_card_key(message_id):
+    if isinstance(message_id, bool):
+        return ""
+    key = str(message_id).strip()
+    return key if key.isdecimal() and int(key) > 0 else ""
+
+
+def record_question_card(message_id, chat_id=None):
+    """Remember a delivered card that waits for an answer. Durable state only, no network."""
+    key = _question_card_key(message_id)
+    if not key:
+        return
+    with _QUESTION_PIN_LOCK:
+        items = _question_pins_load()
+        items[key] = {"message_chat_id": str(CHAT_ID if chat_id is None else chat_id),
+                      "created": _question_pin_clock(), "status": "open"}
+        _question_pins_save(items)
+    _QUESTION_PIN_WAKE.set()
+
+
+def close_question_card(message_id):
+    """The card got its answer or died. Unpinning happens on the next tick."""
+    key = _question_card_key(message_id)
+    if not key:
+        return
+    with _QUESTION_PIN_LOCK:
+        items = _question_pins_load()
+        item = items.get(key)
+        if isinstance(item, dict) and item.get("status") != "closed":
+            item["status"] = "closed"
+            _question_pins_save(items)
+    _QUESTION_PIN_WAKE.set()
+
+
+def _question_card_pending(key, item, picker, session_id, now):
+    """Pending = the picker still owns this card, within its TTL, for the current session."""
+    if item.get("status") != "open":
+        return False
+    try:
+        created = float(item.get("created", 0))
+    except (TypeError, ValueError):
+        return False
+    if not 0 <= now - created < MODEL_PICKER_TTL:
+        return False
+    try:
+        return (picker.get("message_id") == key
+                and time.monotonic() - picker["created"] <= MODEL_PICKER_TTL
+                and bool(session_id) and picker.get("session_id") == session_id)
+    except (KeyError, TypeError):
+        return False
+
+
+def _tg_once(method, timeout=5, **params):
+    """One attempt, no retry. The pin store counts attempts across ticks and restarts."""
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"{API}/{method}", data=data), timeout=timeout) as r:
+            return json.load(r)
+    except Exception as exc:  # noqa: BLE001
+        print(f"tg {method} 실패: {exc}", file=sys.stderr)
+        return None
+
+
+def sync_question_pins():
+    """Maintain only our card pins; one bounded Telegram operation per tick.
+
+    Persist ownership before calling Telegram so a lost response cannot strand an
+    unowned pin. Network I/O stays outside both locks to keep answers responsive.
+    """
+    chat_id = str(CHAT_ID)
+    if not chat_id.isdecimal() or int(chat_id) <= 0:
+        return
+    with _MODEL_PICKER_LOCK:
+        picker = dict(_MODEL_PICKER)
+    session_id = tui_session_id()
+    now = _question_pin_clock()
+    with _QUESTION_PIN_LOCK:
+        items = _question_pins_load()
+        changed = False
+        for key in list(items):
+            item = items[key]
+            if not isinstance(item, dict) or not _question_card_key(key):
+                del items[key]
+                changed = True
+                continue
+            if item.get("message_chat_id") != chat_id:
+                continue  # Another chat's card: never touch it from this configuration.
+            pending = _question_card_pending(key, item, picker, session_id, now)
+            if pending and item.get("pin_confirmed") is True:
+                continue
+            if not pending and not item.get("pin_managed"):
+                del items[key]  # Closed before it was ever pinned.
+                changed = True
+                continue
+            action = "pinChatMessage" if pending else "unpinChatMessage"
+            same_action = item.get("pin_action") == action
+            if same_action and (item.get("pin_attempts", 0) >= QUESTION_PIN_MAX_ATTEMPTS
+                                or now < item.get("pin_retry_at", 0)):
+                continue
+            attempt = item.get("pin_attempts", 0) + 1 if same_action else 1
+            item.update(pin_managed=True, pin_confirmed=None, pin_action=action,
+                        pin_attempts=attempt, pin_retry_at=now + QUESTION_PIN_RETRY_SECONDS)
+            _question_pins_save(items)
+            break
+        else:
+            if changed:
+                _question_pins_save(items)
+            return
+    kwargs = dict(chat_id=chat_id, message_id=int(key))
+    if pending:
+        kwargs["disable_notification"] = "true"
+    result = _tg_once(action, timeout=5, **kwargs)
+    if not (isinstance(result, dict) and result.get("ok") is True and result.get("result") is True):
+        return  # Keep bounded retry and ownership, without changing the answer.
+    with _QUESTION_PIN_LOCK:
+        items = _question_pins_load()
+        item = items.get(key)
+        if (not isinstance(item, dict) or item.get("pin_action") != action
+                or item.get("pin_attempts") != attempt):
+            return
+        if pending:
+            item["pin_confirmed"] = True
+        else:
+            del items[key]  # Unpinned and no longer ours.
+        _question_pins_save(items)
+
+
+def question_pin_tick():
+    """One ticker step: wait for a wake-up or the interval, then sync once."""
+    _QUESTION_PIN_WAKE.wait(QUESTION_PIN_TICK_INTERVAL)
+    _QUESTION_PIN_WAKE.clear()
+    try:
+        sync_question_pins()  # ticked
+    except Exception as exc:  # noqa: BLE001
+        print(f"question pin sync 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def question_pin_ticker(stop_event=None):
+    stop_event = stop_event or threading.Event()
+    while not stop_event.is_set():
+        question_pin_tick()
+
 
 def available_models():
     """Ask this account's CLI catalog; never invent available model IDs."""
@@ -3305,6 +3896,7 @@ def _model_window_label(value):
 
 def _send_model_option_card(selection, stage):
     """Caller holds picker lock. Each delivered step gets a single-use token."""
+    previous_card = _MODEL_PICKER.get("message_id")
     _MODEL_PICKER.clear()
     selection = dict(selection, stage=stage, token=os.urandom(8).hex(), created=time.monotonic())
     if stage == "model":
@@ -3329,6 +3921,9 @@ def _send_model_option_card(selection, stage):
     if mid:
         selection["message_id"] = str(mid)
         _MODEL_PICKER.update(selection)
+        record_question_card(mid)
+    if previous_card and previous_card != str(mid or ""):
+        close_question_card(previous_card)
 
 
 def begin_model_choice(model):
@@ -3381,6 +3976,7 @@ def press_model_option(data, message_id):
         if not valid:
             return tr('이 모델 선택 카드는 만료됐습니다. /model로 다시 선택하세요.')
         _MODEL_PICKER.clear()  # Consume before a send or native submission, including failures.
+        close_question_card(selection.get("message_id"))
         if selection["stage"] == "model":
             begin_model_choice(selection["values"][index])
         elif selection["stage"] == "window":
@@ -3672,6 +4268,15 @@ def handle_telegram_callback(callback):
         else:
             answer(text)
         return
+    if data.startswith(STOP_CALLBACK_PREFIX):
+        sender = cb.get("from") if isinstance(cb.get("from"), dict) else {}
+        if sender and str(sender.get("id")) != str(CHAT_ID):
+            answer(tr("This button is not for this chat."))
+            return
+        status, text = press_stop(data[len(STOP_CALLBACK_PREFIX):], message.get("message_id"))
+        print(f"{TUI_LOG_KEY} 중지 버튼 {status}", file=sys.stderr)
+        answer(text)
+        return
     if not SUGGESTED_REPLY_CONFIRM:
         answer(tr('확인 버튼이 꺼져 있습니다.'))
         return
@@ -3713,7 +4318,7 @@ def _tg_chunks(text, limit):
         yield remaining
 
 
-def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None, telegram_method=None, message_id=None, telegram_code_entity=None, request_progress=False):
+def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_markup=None, telegram_method=None, message_id=None, telegram_code_entity=None, request_progress=False, reply_to_message_id=None, handoff=False):
     """Send one message straight to the Telegram Bot API.
 
     The maintainer's internal build routes delivery through a private message
@@ -3738,11 +4343,14 @@ def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_marku
     if not payload:
         return {"deliveries": []}
     if telegram_method == "editMessageText" and message_id:
+        # Telegram drops the keyboard when an edit omits reply_markup.
+        edit_extra = {"reply_markup": reply_markup} if reply_markup else {}
         res = tg(
             "editMessageText",
             chat_id=CHAT_ID,
             message_id=message_id,
             text=payload[:TG_CHUNK],
+            **edit_extra,
         )
         if not res or not res.get("ok"):
             print(f"telegram editMessageText 실패: {res}", file=sys.stderr)
@@ -3756,6 +4364,10 @@ def deliver_mesh_event(kind, body, *, task_id=None, visibility=None, reply_marku
     first = True
     for chunk in _tg_chunks(payload, TG_CHUNK):
         extra = {}
+        if first and reply_to_message_id:
+            extra["reply_to_message_id"] = reply_to_message_id
+            # Still deliver when the user deleted the message being answered.
+            extra["allow_sending_without_reply"] = "true"
         if first and reply_markup:
             extra["reply_markup"] = reply_markup
         if telegram_code_entity:
@@ -3801,7 +4413,7 @@ def _first_sent_message_id(mesh_result, surface=SEND_SURFACE):
 _ANCHOR_EDIT_OK = frozenset({"sent", "skipped_unchanged"})
 
 
-def _tui_progress_anchor_edit(message_id, text, task_id=None, surface=SEND_SURFACE):
+def _tui_progress_anchor_edit(message_id, text, task_id=None, surface=SEND_SURFACE, reply_markup=None):
     """같은 진행 메시지를 편집한다. 실패해도 새 메시지로 대체하지 않는다."""
     result = deliver_mesh_event(
         "report",
@@ -3810,6 +4422,7 @@ def _tui_progress_anchor_edit(message_id, text, task_id=None, surface=SEND_SURFA
         request_progress=True,
         telegram_method="editMessageText",
         message_id=message_id,
+        reply_markup=reply_markup,
     )
     for delivery in (result or {}).get("deliveries", []):
         if delivery.get("surface") == surface and delivery.get("result") in _ANCHOR_EDIT_OK:
@@ -4034,8 +4647,11 @@ def deliver_photos(paths, caption=""):
     return sent
 
 
-def mirror_answer(source, text, task_id=None):
+def mirror_answer(source, text, task_id=None, reply_to=None):
     """본문 1통 + (있으면) 명령 복붙 버블 N통 + (있으면) 추천답변 버블 1통.
+
+    reply_to(T-261013-033) = 사용자 원래 메시지. 클로드처럼 본문을 그 메시지에 답장으로
+    단다. 지시 카드가 있으면 종전대로 그 카드가 우선이다.
 
     발신 순서 = R-C8 4항: 남은 산문 → 복붙 버블 → 추천답변 버블.
     명령 버블만 telegram_code_entity=true (복사 버튼). 추천답변 버블은 같은
@@ -4053,7 +4669,11 @@ def mirror_answer(source, text, task_id=None):
     body, suggested = split_suggested_reply(text)
     body, copy_bubbles = split_copy_content(body)
     if body or (not copy_bubbles and not photos):
-        deliver_mesh_event("final", body, task_id=task_id)
+        extra = ({"reply_to_message_id": _HANDOFF_CARD.message_id} if _HANDOFF_CARD and _HANDOFF_CARD.message_id
+                 else ({"reply_to_message_id": reply_to} if reply_to else {}))
+        result = deliver_mesh_event("final", body, task_id=task_id, **extra)
+        if _HANDOFF_CARD and _first_sent_message_id(result):
+            _HANDOFF_CARD.finish("응답 완료")
     for bubble in copy_bubbles:
         deliver_mesh_event(
             "copy_content",
@@ -4085,8 +4705,9 @@ def mirror_answer(source, text, task_id=None):
 class _GrokProgressAnchor:
     """One request owns one progress message; ambiguous delivery never reposts it."""
 
-    def __init__(self, task_id=None):
+    def __init__(self, task_id=None, reply_to=None):
         self.task_id = task_id
+        self.reply_to = reply_to
         self.started = time.time()
         self.message_id = None
         self.attempted = False
@@ -4094,35 +4715,54 @@ class _GrokProgressAnchor:
         self.last_text = None
         self.last_edit = 0
         self.lock = threading.RLock()
+        self.handoff = _HANDOFF_CARD if _HANDOFF_CARD and _HANDOFF_CARD.active else None
 
     def update(self, text):
         with self.lock:
             if self.closed or not text:
                 return "anchor"
+            if not self.handoff and _HANDOFF_CARD and _HANDOFF_CARD.active:
+                self.handoff = _HANDOFF_CARD
+            if getattr(self, "wait_for_handoff", False) and not self.handoff:
+                return "anchor"
+            if self.handoff:
+                self.handoff.update(text)
+                self.message_id = self.handoff.message_id
+                self.last_edit = time.time()
+                return "anchor"
             try:
                 if not self.attempted:
                     self.attempted = True
-                    result = deliver_mesh_event("report", text, task_id=self.task_id, request_progress=True)
+                    result = deliver_mesh_event("report", text, task_id=self.task_id, request_progress=True,
+                                                reply_to_message_id=self.reply_to)
                     self.message_id = _first_sent_message_id(result)
                     if not self.message_id:
                         print(f"{TUI_LOG_KEY} 진행 수신증 없음 — 중복 방지를 위해 재발송하지 않음", file=sys.stderr)
                     self.last_text = text
                     self.last_edit = time.time()
                 elif self.message_id and text != self.last_text:
-                    if _tui_progress_anchor_edit(self.message_id, text, task_id=self.task_id):
+                    if _tui_progress_anchor_edit(self.message_id, text, task_id=self.task_id,
+                                                 reply_markup=stop_button_markup(self)):
                         self.last_text = text
                         self.last_edit = time.time()
             except Exception as exc:  # non-fatal; final answer must still be delivered
                 print(f"{TUI_LOG_KEY} 진행 갱신 실패: {exc}", file=sys.stderr)
             return "anchor"
 
-    def close(self, ok, reset=False, text=None, reason=None):
+    def close(self, ok, reset=False, text=None, reason=None, interrupted=None):
         with self.lock:
             if self.closed:
                 return
+            # 마감 편집이 버튼을 다시 싣지 않게 먼저 거둔다 (T-261013-033).
+            retire_stop_button(self)
+            if self.handoff:
+                self.handoff.finish("응답 완료" if ok else ("표시 종료 · 새 요청" if reset else "중단됨"))
+                self.closed = True
+                return
             if self.message_id:
                 self.update(text or _tui_progress_done_line(
-                    time.time() - self.started, ok=ok, reset=reset, reason=reason))
+                    time.time() - self.started, ok=ok, reset=reset, reason=reason,
+                    interrupted=interrupted))
             self.closed = True
 
 
@@ -4139,11 +4779,41 @@ def _close_local_progress():
         _TUI_LOCAL_PROGRESS["anchor"] = None
 
 
+_HANDOFF_CARD = None
+
+
+def handoff_card():
+    global _HANDOFF_CARD
+    if _HANDOFF_CARD is None:
+        def send(body):
+            return _first_sent_message_id(deliver_mesh_event("report", body, handoff=True, request_progress=True))
+        def edit(mid, body):
+            result = deliver_mesh_event("report", body, handoff=True, telegram_method="editMessageText",
+                                        message_id=mid, request_progress=True)
+            return any(d.get("result") in {"sent", "skipped_unchanged"} for d in result.get("deliveries", []))
+        _HANDOFF_CARD = _turn_mirror.HandoffCard(
+            os.path.join(STATE_DIR, f"grok-bridge-{NAME}.handoff.json"), send, edit)
+    return _HANDOFF_CARD
+
+
+def begin_handoff(text, key):
+    context = _turn_mirror.handoff_context(text, NAME, "grok")
+    if not context:
+        if _HANDOFF_CARD is not None:
+            _HANDOFF_CARD.forget()
+        return False
+    handoff_card().begin(context, key)
+    return True
+
+
 def _deliver_local_tui_prompt(question, key):
     """터미널에 막 친 질문을 최종답 전에 폰으로 올린다 (T-260914-005)."""
     global _LOCAL_TUI_PROMPTS_SENT
     if not question or key in _LOCAL_TUI_PROMPTS_SENT:
         return False
+    if begin_handoff(question, key):
+        _LOCAL_TUI_PROMPTS_SENT.add(key)
+        return True
     prompt = _turn_mirror.format_prompt_mirror(question)
     if not prompt:
         return False
@@ -4368,7 +5038,7 @@ def mirror_error(source, text, task_id=None):
     deliver_mesh_event("error", msg, task_id=task_id)
 
 
-def process_job(source, text, task_id=None):
+def process_job(source, text, task_id=None, reply_to=None):
     if consume_language_command(text):
         return
     if slash_token(text) == "/model":
@@ -4383,15 +5053,25 @@ def process_job(source, text, task_id=None):
     if is_awaiting_human() and source != "telegram":
         print(f"{TUI_LOG_KEY} /clear 이후 기계 잡 폐기 source={source}", file=sys.stderr)
         return
+    incoming_handoff = _turn_mirror.handoff_context(text, NAME, "grok")
+    if CHAT_LANE == "tui" and incoming_handoff:
+        _close_local_progress()
+        if _HANDOFF_CARD:
+            _HANDOFF_CARD.forget()
+    if CHAT_LANE != "tui" or not incoming_handoff:
+        _close_local_progress()
+        begin_handoff(text, f"job:{time.time_ns()}")
     mirror_prompt(source, text)
     started = time.time()
     typing_stop = start_typing()
-    progress = _GrokProgressAnchor(task_id)
+    progress = _GrokProgressAnchor(task_id, reply_to=reply_to)
+    progress.wait_for_handoff = bool(CHAT_LANE == "tui" and incoming_handoff)
     on_progress = progress.update
     close_anchor = progress.close
-    on_progress(_tui_progress_line([], 0))
+    if CHAT_LANE != "tui" or not incoming_handoff:
+        on_progress(_tui_progress_line([], 0))
 
-    outcome = {"ok": False, "reset": False, "reason": None}
+    outcome = {"ok": False, "reset": False, "reason": None, "interrupted": None}
     try:
         with GROK_LOCK:
             _close_local_progress()
@@ -4401,6 +5081,12 @@ def process_job(source, text, task_id=None):
                 CHAT_ID, text, on_progress=on_progress
             )
         outcome["ok"] = True
+    except GrokTurnCancelled as exc:
+        # 사람·즉시입력이 멈춘 턴이다. 실패 통을 보내지 않고 카드만 「중단」으로 닫는다.
+        print(f"{TUI_LOG_KEY} 네이티브 턴 취소 trigger={exc.trigger or '?'}", file=sys.stderr)
+        outcome["interrupted"] = exc.trigger or "cancelled"
+        _tui_inflight_clear()
+        return
     except GrokExecError as exc:
         if "레인을 되세웠" in str(exc):
             print(f"{TUI_LOG_KEY} /clear 가 물린 잡을 접었다", file=sys.stderr)
@@ -4416,9 +5102,11 @@ def process_job(source, text, task_id=None):
         return
     finally:
         typing_stop.set()
-        # ★return 이 먼저 도는 갈래(에러 2종)에서도 앵커는 닫힌다 — finally 라서.
-        close_anchor(outcome["ok"], reset=outcome["reset"], reason=outcome.get("reason"))
-    mirror_answer(source, answer, task_id=task_id)
+        # ★return 이 먼저 도는 갈래(에러 2종·취소)에서도 앵커는 닫힌다 — finally 라서.
+        close_anchor(outcome["ok"], reset=outcome["reset"], reason=outcome.get("reason"),
+                     interrupted=outcome.get("interrupted"))
+    thread = {"reply_to": reply_to} if reply_to else {}
+    mirror_answer(source, answer, task_id=task_id, **thread)
     _tui_inflight_clear()
 
 
@@ -4440,13 +5128,19 @@ def job_worker():
             # 회수 잡을 일반 잡으로 흘리면 같은 질문을 다시 붙여넣어 턴이 두 번 돈다.
             source, text = job[0], job[1]
             meta = job[2] if len(job) > 2 else None
+            # 앞 잡의 턴은 끝났다 — 그 턴의 즉시입력 안내를 닫는다 (T-261013-033).
+            #   안내를 못 닫아도 이 잡은 돈다. 여기서 예외가 나면 사용자 메시지를 버린다.
+            try:
+                retire_send_now_card()
+            except Exception as exc:  # noqa: BLE001
+                print(f"{TUI_LOG_KEY} 즉시입력 안내 정리 실패: {exc}", file=sys.stderr)
             # 미러는 이 플래그가 내려갈 때까지 비켜선다 (T-260824-036). process_job 은
             # GROK_LOCK 을 놓은 뒤에 답을 배달·커서 갱신하므로 락만으로는 창이 남는다.
             _TUI_JOB_ACTIVE.set()
             if isinstance(meta, dict) and meta.get("kind") == "injected_harvest":
                 process_injected_harvest(source, text, meta)
             else:
-                process_job(source, text)
+                process_job(source, text, reply_to=meta.get("reply_to") if isinstance(meta, dict) else None)
         except Exception as exc:  # noqa: BLE001
             print(f"grok bridge worker 실패: {exc}", file=sys.stderr)
         finally:
@@ -4461,7 +5155,8 @@ def job_worker():
 
 
 
-def handle_message_text(text, source="telegram"):
+def handle_message_text(text, source="telegram", reply_to=None):
+    """reply_to = 사용자 원래 메시지 번호. 진행 카드·최종 답을 그 메시지에 답장으로 단다."""
     text = (text or "").strip()
     if not text:
         return
@@ -4510,7 +5205,8 @@ def handle_message_text(text, source="telegram"):
         return
 
     busy = GROK_LOCK.locked()
-    JOBS.put((source, text))
+    # 3튜플이어도 kind 가 없으면 일반 잡이다 — 회수 잡 판정은 meta.kind 로만 한다.
+    JOBS.put((source, text, {"reply_to": reply_to}) if reply_to else (source, text))
     health_mark(last_enqueue_at=time.time(), enqueued=1)
     if busy:
         announce_queued_in_tui(text)
@@ -4931,6 +5627,13 @@ def prompt_from_telegram_message(message, update_id):
     return caption_text
 
 
+def _update_message_id(upd):
+    """답장으로 이을 원래 메시지 번호 (T-261013-033). 없으면 None."""
+    msg = upd.get("message") or upd.get("edited_message") or {}
+    mid = msg.get("message_id") if isinstance(msg, dict) else None
+    return mid if isinstance(mid, int) and not isinstance(mid, bool) and mid > 0 else None
+
+
 def telegram_prompt_from_update(upd):
     """폴러가 쓰는 진입점. 글·미디어를 한 경로로 돌려준다. 해당 챗이 아니면 빈 문자열."""
     msg = upd.get("message") or upd.get("edited_message")
@@ -4971,7 +5674,7 @@ def telegram_poller():
                 inbox_spool(upd.get("update_id"), "telegram", text)
                 preview = text.strip().splitlines()[0][:80]
                 print(f">>> [{NAME}] 텔레그램 grok: {preview}", flush=True)
-                handle_message_text(text, source="telegram")
+                handle_message_text(text, source="telegram", reply_to=_update_message_id(upd))
             except Exception as exc:  # noqa: BLE001
                 print(f"telegram update 처리 실패: {exc}", file=sys.stderr)
             finally:
@@ -5127,6 +5830,10 @@ def start_workers():
     threading.Thread(
         target=health_ticker, daemon=True, name=f"grok-bridge-{NAME}-health"
     ).start()
+    if not DRY_RUN and bool_env("GRB_QUESTION_PIN", True):
+        threading.Thread(
+            target=question_pin_ticker, daemon=True, name=f"grok-bridge-{NAME}-question-pins"
+        ).start()
     if CHAT_LANE == "tui" and not DRY_RUN and bool_env("GRB_TUI_HEALTH_TICK", True):
         threading.Thread(
             target=tui_health_watch_ticker, daemon=True,
