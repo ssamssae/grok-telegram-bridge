@@ -47,6 +47,19 @@ set -uo pipefail
 #   서로 다른 파일을 보고 fail-closed 로 막힌다 — 그래서 기본값을 공유한다.
 GRB_LIB_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME="${GRB_NAME:-grok}"
+# Grok account (profile) split, same rule as the bridge: GRB_GROK_HOME, then
+# GROK_HOME, then $HOME/.grok. The TUI inherits GROK_HOME from this process.
+grok_home_override() {
+  if [ -n "${GRB_GROK_HOME:-}" ]; then printf '%s' "${GRB_GROK_HOME}"; fi
+  return 0
+}
+grok_home_effective() {
+  if [ -n "${GRB_GROK_HOME:-}" ]; then printf '%s' "${GRB_GROK_HOME}"
+  elif [ -n "${GROK_HOME:-}" ]; then printf '%s' "${GROK_HOME}"
+  else printf '%s' "${HOME}/.grok"; fi
+  return 0
+}
+if [ -n "$(grok_home_override)" ]; then GROK_HOME="$(grok_home_override)"; export GROK_HOME; fi
 DRIFT_EXIT="${GRB_TUI_DRIFT_EXIT:-9}"
 STATE_DIR="${GRB_STATE_DIR:-$HOME/.grok-telegram-bridge/state}"
 GROK_BIN="${GRB_GROK_BIN:-grok}"
