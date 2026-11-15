@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -190,6 +191,8 @@ _HEALTH = {
     "name": NAME,
     "started_at": time.time(),
     "last_poll_at": 0.0,
+    "last_poll_ok_at": 0.0,
+    "poll_fail_streak": 0,
     "last_enqueue_at": 0.0,
     "last_job_started_at": 0.0,
     "last_job_done_at": 0.0,
@@ -373,12 +376,23 @@ def get_or_create_session_uuid(chat_id):
     return read_session_uuid(chat_id)
 
 
-def tg(method, timeout=60, **params):
+# getUpdates 롱폴 (T-261116-013): tg() 의 timeout 은 소켓 제한이다. 텔레그램이 요청을 붙들
+# 롱폴 초는 long_poll_timeout 으로 따로 받아 timeout 파라미터로 보낸다. 0.6.9 까지는 폴러의 30 이
+# 소켓에만 가서 텔레그램이 바로 답했고(짧은 폴링), 폴러가 쉬지 않고 다시 물었다. 커서 #2811 과 같은 원인.
+GETUPDATES_LONG_POLL_SEC = 30
+GETUPDATES_SOCKET_SLACK_SEC = 15
+
+
+def tg(method, timeout=60, long_poll_timeout=None, **params):
+    socket_timeout = timeout
+    if long_poll_timeout is not None:
+        params["timeout"] = long_poll_timeout
+        socket_timeout = max(float(timeout), float(long_poll_timeout) + GETUPDATES_SOCKET_SLACK_SEC)
     data = urllib.parse.urlencode(params).encode()
     url = f"{API}/{method}"
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=socket_timeout) as r:
                 return json.load(r)
         except Exception as e:  # noqa: BLE001
             if attempt == 2:
@@ -5760,17 +5774,33 @@ def telegram_prompt_from_update(upd):
         return ""
 
 
+# cub health.json 과 같은 뜻의 연속 실패 수. 백오프·종료에는 쓰지 않는다.
+_POLL_FAIL_STREAK = 0
+
+
 def telegram_poller():
+    global _POLL_FAIL_STREAK
     offset = _read(OFFSET_FILE)
     offset = int(offset) if offset.isdigit() else 0
     while True:
-        res = tg("getUpdates", offset=offset, timeout=30)
+        res = tg(
+            "getUpdates",
+            offset=offset,
+            timeout=GETUPDATES_LONG_POLL_SEC,
+            long_poll_timeout=GETUPDATES_LONG_POLL_SEC,
+        )
         # ★폴러 생존 스탬프 — 「입력이 없어 조용한 것」과 「폴러가 죽어 조용한 것」은
         #   종전 계기로 구분할 수 없었다(둘 다 로그 0). 이 한 줄이 그 둘을 가른다.
-        health_mark(last_poll_at=time.time())
+        # last_poll_at 은 성공·실패 모두 갱신한다. last_poll_ok_at 은 성공만,
+        # poll_fail_streak 은 연속 실패 수다. 대기 3초와 종료는 그대로다.
+        now = time.time()
         if not res or not res.get("ok"):
+            _POLL_FAIL_STREAK += 1
+            health_mark(last_poll_at=now, poll_fail_streak=_POLL_FAIL_STREAK)
             time.sleep(3)
             continue
+        _POLL_FAIL_STREAK = 0
+        health_mark(last_poll_at=now, last_poll_ok_at=now, poll_fail_streak=0)
         for upd in res.get("result", []):
             try:
                 callback = upd.get("callback_query")
