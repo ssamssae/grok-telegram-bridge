@@ -1,0 +1,9 @@
+# 0.6.10 — long polling for Telegram
+
+- The bridge now long-polls Telegram. `getUpdates` asks Telegram to hold the request for up to 30 seconds and gives the socket 15 seconds more than that. Up to 0.6.9 the poller's 30-second value only set the socket timeout, so Telegram answered at once and the bridge asked again right away; on our machine an idle bridge polled every one to three seconds. Now an idle bridge polls about every 30 seconds, and a new message still arrives as soon as Telegram has it.
+- Only `getUpdates` changed. Other Bot API calls keep their 60-second socket timeout and send no `timeout` parameter. A failed poll still waits 3 seconds and tries again, and the bridge does not exit on its own.
+- The health file gains `last_poll_ok_at`, the time of the last successful poll, and `poll_fail_streak`, the number of failed polls in a row. `last_poll_at` still changes after every poll, successful or not.
+
+Validation: unit tests for polling (the poller passes a 30-second long poll; the request body carries `timeout=30` and the socket timeout is 45 seconds; other methods send no `timeout` and keep 60 seconds), the new poll tests also on Python 3.9; mutation probes on the long-poll parameter, the socket margin, and the poller's argument; the bridge's unit suite (103 tests); a live run on our own machine, where the time between polls went from one to three seconds to about 30 seconds with no failed polls; the public export with its undefined-global gate and internal-symbol audit; private-data and token scans with two independent scanners compared against 0.6.9; release-notes lint; and the public suite (92 tests, 5 other-engine skips, run on Python 3.14 and 3.9). A source bundle is included.
+
+This is a GitHub release. It does not upload to PyPI, restart an installed bridge, or change an existing config. The bridge changed, so restart a running bridge to use 0.6.10.
