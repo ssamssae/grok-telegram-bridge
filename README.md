@@ -8,6 +8,15 @@ computer. Grok's finished answer comes back to your phone.
 This bridge is Grok-specific. It is a sibling of the Claude Telegram Bridge and
 the Codex Telegram Bridge, but it keeps its own sessions and credentials.
 
+## New in 0.6.10
+
+The bridge now long-polls Telegram: `getUpdates` asks Telegram to hold the
+request for up to 30 seconds, so an idle bridge polls about every 30 seconds
+instead of every few seconds, and a new message still arrives right away. The
+health file also records the last successful poll (`last_poll_ok_at`) and the
+failed polls in a row (`poll_fail_streak`).
+[Release notes](RELEASE_NOTES-0.6.10.md).
+
 ## New in 0.6.9
 
 `python3 bridge_setup.py doctor` checks an install at any time and changes
